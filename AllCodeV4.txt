@@ -1,0 +1,1714 @@
+===== AllCodeV4.txt =====
+
+
+===== Cargo.toml =====
+[package]
+name    = "tsqc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# Build both a Rust static lib (for tests & other crates) *and* a cdylib for PyO3.
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pyo3        = { version = "0.25.1", features = ["extension-module"] }
+bitvec      = "1.0"
+rand        = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+approx = "0.5"
+
+[package.metadata.maturin]
+python-packages = ["tsqc"]          # neem het hele tsqc-package op
+
+
+
+===== pyproject.toml =====
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tsqc"
+version = "0.1.0"
+description = "Tabu Search for Quasi-Cliques (Rust core, Python bindings)"
+requires-python = ">=3.9"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+
+[tool.maturin]
+#  The compiled extension will be installed as tsqc/_native.* (pyd/so)
+module-name     = "tsqc._native"
+#  Include the entire pure-Python package in the wheel
+python-packages = ["tsqc"]
+#  Build in release mode by default when 'maturin develop -r' is used
+
+===== quick_check.py =====
+from pathlib import Path
+from tsqc.data_loader import load_dimacs
+
+n, edges = load_dimacs(Path("benchmarks/hamming8-4.clq"))
+print(f"n={n}, |E|={len(edges)}")
+
+===== README.md =====
+# TSQC – Tabu Search for Quasi-Cliques in Rust
+
+===== src\construct.rs =====
+//! Constructors for an initial vertex subset S₀.
+//!
+//! * `random_k` – choose k distinct vertices uniformly at random.
+//! * `greedy_k` – take the k highest-degree vertices.
+//! * `greedy_random_k` – greedy heuristic with a random start (for TSQC initial solution).
+//! 
+//! All these constructors return a ready-to-use [`Solution`] with edge counts pre-computed.
+
+use crate::{graph::Graph, solution::Solution};
+use rand::seq::SliceRandom;
+use rand::Rng;
+
+/// Pick `k` distinct vertices uniformly at random.
+///
+/// `rng` is any mutable RNG; `k` must not exceed `graph.n()`.
+pub fn random_k<'g, R>(graph: &'g Graph, k: usize, rng: &mut R) -> Solution<'g>
+where
+    R: Rng + ?Sized,
+{
+    assert!(k <= graph.n(), "k larger than graph size");
+    let mut idx: Vec<usize> = (0..graph.n()).collect();
+    idx.shuffle(rng);
+
+    let mut sol = Solution::new(graph);
+    for &v in &idx[..k] {
+        sol.add(v);
+    }
+    sol
+}
+
+/// Greedy initialization: take the `k` highest-degree vertices.
+pub fn greedy_k<'g>(graph: &'g Graph, k: usize) -> Solution<'g> {
+    assert!(k <= graph.n(), "k larger than graph size");
+    let mut idx: Vec<usize> = (0..graph.n()).collect();
+    idx.sort_unstable_by_key(|&v| std::cmp::Reverse(graph.degree(v)));
+
+    let mut sol = Solution::new(graph);
+    for &v in &idx[..k] {
+        sol.add(v);
+    }
+    sol
+}
+
+/// Greedy-random initialization: start with one random vertex, then iteratively add the vertex 
+/// with the most neighbors in the current set (tie-break randomly) until size `k`.
+///
+/// This heuristic injects randomness into the construction of the initial subset S₀, as described 
+/// in TSQC §3.3:contentReference[oaicite:60]{index=60}:contentReference[oaicite:61]{index=61}. It helps generate diverse starting solutions rather 
+/// than always beginning with the same highest-degree vertices.
+pub fn greedy_random_k<'g, R>(graph: &'g Graph, k: usize, rng: &mut R) -> Solution<'g>
+where
+    R: Rng + ?Sized,
+{
+    assert!(k <= graph.n(), "k larger than graph size");
+    let mut sol = Solution::new(graph);
+    if k == 0 {
+        return sol;
+    }
+    // Step 1: add one random vertex as the starting seed
+    let v0 = rng.gen_range(0..graph.n());
+    sol.add(v0);
+    // Step 2: Iteratively add the vertex with the most neighbors in the current set
+    // Continue until the solution reaches size k.
+    while sol.size() < k {
+        let mut best_neighbor_count = 0;
+        let mut best_candidates: Vec<usize> = Vec::new();
+        // Evaluate each outsider vertex by how many connections it has into the current solution
+        for w in 0..graph.n() {
+            if sol.bitset()[w] {
+                continue;
+            }
+            let neighbors_in_sol = graph.neigh_row(w)
+                .iter_ones()
+                .filter(|&u| sol.bitset()[u])
+                .count();
+            if neighbors_in_sol > best_neighbor_count {
+                // Found a new outsider with a higher connection count
+                best_neighbor_count = neighbors_in_sol;
+                best_candidates.clear();
+                best_candidates.push(w);
+            } else if neighbors_in_sol == best_neighbor_count {
+                // Tied for highest connections - include in candidates for random tie-break
+                best_candidates.push(w);
+            }
+        }
+        if best_candidates.is_empty() {
+            break;  // No outsiders (should not happen unless k equals graph.n())
+        }
+        // Choose one of the top candidates at random to introduce some randomness
+        best_candidates.shuffle(rng);
+        let w = best_candidates[0];
+        sol.add(w);
+    }
+    return sol;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use rand_chacha::ChaCha8Rng;
+    use rand::SeedableRng;
+
+    fn triangle() -> Graph {
+        // Simple 3-vertex triangle graph
+        let dimacs = b"p edge 3 3\n\
+                       e 1 2\n\
+                       e 1 3\n\
+                       e 2 3\n";
+        Graph::parse_dimacs(Cursor::new(dimacs)).unwrap()
+    }
+
+    #[test]
+    fn random_vs_greedy() {
+        let g = triangle();
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let r = random_k(&g, 2, &mut rng);
+        assert_eq!(r.size(), 2);
+        let g2 = greedy_k(&g, 2);
+        assert_eq!(g2.size(), 2);
+    }
+
+    // (No direct test for greedy_random_k here, but its behavior can be inferred from its construction.)
+}
+
+===== src\diversify.rs =====
+//! Diversification operators for TSQC (applied when the search is stuck in a local optimum).
+//!
+//! Heavy perturbation introduces a large disruption: it swaps out one vertex from the solution
+//! for a very low-degree vertex not in the solution, producing a worse (lower-density) interim
+//! solution to escape a local optimum. Mild perturbation is a smaller change: it swaps out a
+//! “critical” vertex (one of the least connected in S) for a well-connected outsider, often
+//! yielding only a slight decrease in density.  Both moves reset the tabu lists, and the search
+//! then continues from the perturbed solution.
+
+use crate::{solution::Solution, tabu::DualTabu, params::Params};
+use rand::seq::SliceRandom;
+use rand::Rng;
+
+/*───────────────────────────────────────────────────────────────────*/
+/*  Heavy perturbation                                               */
+/*───────────────────────────────────────────────────────────────────*/
+
+/// Heavy perturbation: remove one random vertex from S, then add an outsider with very few
+/// connections to S.
+///
+/// A “low-degree” outside vertex is chosen (degree < *h* in the current S) such that the new
+/// solution is worse (density decreases), helping the search jump to a new region.  The tabu
+/// lists are **reset** after this move, clearing any short-term memory.  The parameter `p` is
+/// used for `gamma_target` (quasi-clique density) in adaptive tenure updates.
+pub fn heavy_perturbation<'g, R>(
+    sol: &mut Solution<'g>,
+    tabu: &mut DualTabu,
+    rng: &mut R,
+    p: &Params,
+    freq: &mut [usize],
+) where
+    R: Rng + ?Sized,
+{
+    /* Guard */
+    let k = sol.size();
+    if k == 0 {
+        return;
+    }
+
+    /* 1 ─ randomly remove one vertex from S */
+    let mut inside: Vec<usize> = sol.bitset().iter_ones().collect();
+    inside.shuffle(rng);
+    let u = inside[0];
+    sol.remove(u);
+
+    /* 2 ─ determine threshold h for “low-degree” outsider.
+     *     Heuristic: if the graph is very sparse, sqrt(k) may be too strict – use k^0.85. */
+    let n = sol.graph().n();
+    let graph_density = if n < 2 {
+        0.0
+    } else {
+        2.0 * (sol.graph().m() as f64) / ((n * (n - 1)) as f64)
+    };
+    let mut h: f64 = if graph_density * (k as f64) <= 1.0 {
+        // extremely sparse –- relax threshold
+        (k as f64).powf(0.85)
+    } else {
+        (k as f64).sqrt()
+    };
+    h = h.clamp(1.0, k as f64 - 1.0).ceil();          // ensure 1 ≤ h ≤ k-1
+    let h_thresh = h as usize;
+
+    /* 3 ─ pick outsider with < h edges into current S */
+    let mut outsiders: Vec<usize> =
+        (0..sol.graph().n()).filter(|&v| !sol.bitset()[v]).collect();
+    outsiders.shuffle(rng);
+
+    let mut v_opt = None;
+    for &w in &outsiders {
+        let deg_in = sol
+            .graph()
+            .neigh_row(w)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if deg_in < h_thresh {
+            v_opt = Some(w);
+            break;
+        }
+    }
+    let v = v_opt.unwrap_or_else(|| {
+        // no outsider below threshold – take one with minimal degree into S
+        outsiders
+            .iter()
+            .copied()
+            .min_by_key(|&w| {
+                sol.graph()
+                    .neigh_row(w)
+                    .iter_ones()
+                    .filter(|&j| sol.bitset()[j])
+                    .count()
+            })
+            .unwrap()
+    });
+    sol.add(v);
+
+    /* 4 ─ update long-term frequencies */
+    for &vx in &[u, v] {
+        freq[vx] += 1;
+        if freq[vx] > k {
+            freq.fill(0);
+        }
+    }
+
+    /* 5 ─ adapt tabu tenures to new (worse) solution & reset lists */
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+    tabu.reset();
+}
+
+/*───────────────────────────────────────────────────────────────────*/
+/*  Mild perturbation                                                */
+/*───────────────────────────────────────────────────────────────────*/
+
+/// Mild perturbation: swap worst vertex in S for best outsider (smallest drop in density).
+///
+/// Removes one critical vertex (lowest internal degree) and adds one outsider with the most
+/// edges into S.  Often only slightly degrades density and provides gentle diversification.
+pub fn mild_perturbation<'g, R>(
+    sol: &mut Solution<'g>,
+    tabu: &mut DualTabu,
+    rng: &mut R,
+    p: &Params,
+    freq: &mut [usize],
+) where
+    R: Rng + ?Sized,
+{
+    /* Guard */
+    if sol.size() == 0 {
+        return;
+    }
+
+    /* 1 ─ identify worst vertex in S */
+    let curr_d = sol.density();
+    let crit_thr = (curr_d * ((sol.size() as f64) - 1.0)).floor() as usize;
+
+    let mut worst_v = None;
+    let mut worst_deg = usize::MAX;
+
+    for u in sol.bitset().iter_ones() {
+        let deg_in = sol
+            .graph()
+            .neigh_row(u)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if deg_in < crit_thr && deg_in < worst_deg {
+            worst_deg = deg_in;
+            worst_v = Some(u);
+        }
+    }
+    // if no vertex is strictly critical, take one with minimal internal degree anyway
+    if worst_v.is_none() {
+        for u in sol.bitset().iter_ones() {
+            let deg_in = sol
+                .graph()
+                .neigh_row(u)
+                .iter_ones()
+                .filter(|&j| sol.bitset()[j])
+                .count();
+            if deg_in < worst_deg {
+                worst_deg = deg_in;
+                worst_v = Some(u);
+            }
+        }
+    }
+    let u = worst_v.expect("S non-empty, so a vertex must exist");
+    sol.remove(u);
+
+    /* 2 ─ outsider with max connections into new S */
+    let mut max_edges = 0usize;
+    for w in 0..sol.graph().n() {
+        if sol.bitset()[w] {
+            continue;
+        }
+        let edges_in = sol
+            .graph()
+            .neigh_row(w)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        max_edges = max_edges.max(edges_in);
+    }
+    let mut best_outsiders = Vec::new();
+    for w in 0..sol.graph().n() {
+        if sol.bitset()[w] {
+            continue;
+        }
+        let edges_in = sol
+            .graph()
+            .neigh_row(w)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if edges_in == max_edges {
+            best_outsiders.push(w);
+        }
+    }
+    best_outsiders.shuffle(rng);
+    let v = best_outsiders[0];
+    sol.add(v);
+
+    /* 3 ─ update frequencies */
+    for &vx in &[u, v] {
+        freq[vx] += 1;
+        if freq[vx] > sol.size() {
+            freq.fill(0);
+        }
+    }
+
+    /* 4 ─ update tabu & reset */
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+    tabu.reset();
+}
+
+===== src\graph.rs =====
+//! Simple undirected graph stored as an adjacency BitVec per row.
+//! Supports DIMACS *.clq parsing and edge iteration.
+
+use bitvec::prelude::*;
+use std::io::{BufRead, Read};
+
+#[derive(Clone, Debug)]
+pub struct Graph {
+    /// Row‐major adjacency; `adj[i][j]` is 1 ⇔ edge (i,j) exists, j≠i.
+    adj: Vec<BitVec>,
+}
+
+impl Graph {
+    /*────────── constructors ──────────*/
+
+    /// Empty graph with `n` isolated vertices.
+    pub fn with_vertices(n: usize) -> Self {
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            rows.push(bitvec![0; n]);
+        }
+        Self { adj: rows }
+    }
+
+    /// Build from explicit edge list (0-based indices, undirected).
+    pub fn from_edge_list(n: usize, edges: &[(usize, usize)]) -> Self {
+        let mut g = Self::with_vertices(n);
+        for &(u, v) in edges {
+            g.add_edge(u, v);
+        }
+        g
+    }
+
+    /// Parse DIMACS *.clq format from any buffered reader.
+    pub fn parse_dimacs<R: Read>(reader: R) -> std::io::Result<Self> {
+        let mut n = 0usize;
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+
+        for line in std::io::BufReader::new(reader).lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('c') { continue; }
+            if line.starts_with('p') {
+                // p edge <n> <m>
+                let parts: Vec<_> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    n = parts[2].parse().unwrap_or(0);
+                }
+            } else if line.starts_with('e') {
+                // e u v   (1-based)
+                let parts: Vec<_> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let u: usize = parts[1].parse().unwrap();
+                    let v: usize = parts[2].parse().unwrap();
+                    edges.push((u - 1, v - 1));
+                }
+            }
+        }
+        Ok(Self::from_edge_list(n, &edges))
+    }
+
+    /*────────── getters ──────────*/
+
+    #[inline] pub fn n(&self) -> usize { self.adj.len() }
+
+    /// Number of edges (each counted once).
+    pub fn m(&self) -> usize {
+        let mut m = 0usize;
+        for i in 0..self.n() {
+            for j in self.neigh_row(i).iter_ones().filter(|&j| j > i) {
+                if self.adj[i][j] { m += 1; }
+            }
+        }
+        m
+    }
+
+    /// Degree of vertex v.
+    #[inline]
+    pub fn degree(&self, v: usize) -> usize {
+        self.adj[v].count_ones()
+    }
+
+    /// Immutable row slice for adjacency of v.
+    #[inline]
+    pub fn neigh_row(&self, v: usize) -> &BitSlice {
+        &self.adj[v]
+    }
+
+    /// Return all edges as Vec<(u,v)> with u < v.
+    pub fn edge_list(&self) -> Vec<(usize, usize)> {
+        let mut edges = Vec::with_capacity(self.m());
+        for i in 0..self.n() {
+            for j in self.neigh_row(i).iter_ones().filter(|&j| j > i) {
+                edges.push((i, j));
+            }
+        }
+        edges
+    }
+
+    /*────────── mutators ──────────*/
+
+    #[inline]
+    pub fn add_edge(&mut self, u: usize, v: usize) {
+        assert!(u < self.n() && v < self.n() && u != v);
+        self.adj[u].set(v, true);
+        self.adj[v].set(u, true);
+    }
+}
+
+/*────────────────── tiny unit check ──────────────────*/
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_triangle() {
+        let g = Graph::from_edge_list(3, &[(0, 1), (0, 2), (1, 2)]);
+        assert_eq!(g.n(), 3);
+        assert_eq!(g.m(), 3);
+        assert_eq!(g.edge_list().len(), 3);
+    }
+}
+
+===== src\lib.rs =====
+//! TSQC – Rust-kernel + PyO3 bindings.
+
+use pyo3::prelude::*;
+use pyo3::wrap_pyfunction;
+use pyo3::types::PyModule;
+use pyo3::prelude::Bound;       // Bound<'py, T> API in PyO3 v0.25
+
+/*───────── interne modules ─────────*/
+pub mod graph;
+pub mod solution;
+pub mod tabu;
+pub mod construct;
+pub mod neighbour;
+pub mod diversify;
+pub mod params;
+pub mod restart;
+pub mod maxk;
+
+/*───────── re-exports voor Rust-gebruikers ─────────*/
+pub use graph::Graph;
+pub use solution::Solution;
+pub use params::Params;
+pub use restart::solve_fixed_k;
+pub use maxk::solve_maxk;
+
+/*───────── extern util ─────────*/
+use rand_chacha::ChaCha8Rng;
+use rand::SeedableRng;
+use std::fs::File;
+use std::io::BufReader;
+
+/*======================================================================
+│  Python-functies
+└=====================================================================*/
+
+/// Fixed-k solver – returns density of best k-subset.
+#[pyfunction]
+#[pyo3(text_signature = "(graph_path, k, gamma, seed)")]
+fn solve_k_py(graph_path: String, k: usize, gamma: f64, seed: u64) -> PyResult<f64> {
+    let file = File::open(&graph_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let graph = Graph::parse_dimacs(BufReader::new(file))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let mut p = Params::default();
+    p.gamma_target = gamma;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let sol = solve_fixed_k(&graph, k, &mut rng, &p);
+    Ok(sol.density())
+}
+
+/// Max-k solver – returns (size, density) of best quasi-clique.
+#[pyfunction]
+#[pyo3(text_signature = "(graph_path, gamma, seed)")]
+fn solve_max_py(graph_path: String, gamma: f64, seed: u64) -> PyResult<(usize, f64)> {
+    let file = File::open(&graph_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let graph = Graph::parse_dimacs(BufReader::new(file))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let mut p = Params::default();
+    p.gamma_target = gamma;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let sol = maxk::solve_maxk(&graph, &mut rng, &p);
+    Ok((sol.size(), sol.density()))
+}
+
+/// Helper: parse DIMACS, return (n, m).
+#[pyfunction]
+#[pyo3(text_signature = "(graph_path)")]
+fn parse_dimacs_py(graph_path: String) -> PyResult<(usize, usize)> {
+    let file = File::open(&graph_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let graph = Graph::parse_dimacs(BufReader::new(file))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok((graph.n(), graph.m()))
+}
+
+/*======================================================================
+│  PyO3 module-init
+└=====================================================================*/
+
+/// ***Important***: name `_native` must match `pyproject.toml -> module-name`.
+#[pymodule]
+fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(solve_k_py, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_max_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_dimacs_py, m)?)?;
+    Ok(())
+}
+
+===== src\maxk.rs =====
+//! Outer “max-k” search: find the largest γ-quasi-clique by
+//! solving a series of fixed-k problems for increasing `k`.
+//!
+//! *Stop-criterium volgens paper*: zodra twee opeenvolgende k-waarden
+//! geen γ-feasible oplossing opleveren, gaan we ervan uit dat geen
+//! groter γ-quasi-clique bestaat en stoppen we.
+
+use crate::{params::Params, restart::solve_fixed_k, solution::Solution, Graph};
+use rand::Rng;
+
+/// Solve the MQCP for a given graph and parameters.
+/// Returns the largest γ-quasi-clique (best size, densest among ties).
+pub fn solve_maxk<'g, R>(
+    graph: &'g Graph,
+    rng: &mut R,
+    p: &Params,
+) -> Solution<'g>
+where
+    R: Rng + ?Sized,
+{
+    // best solution seen so far
+    let mut best_sol = Solution::new(graph); // empty
+    let mut best_d   = 0.0;
+
+    // stop when we fail for two consecutive k
+    let mut consecutive_fail = 0usize;
+
+    // iterate k from 2 up to n
+    for k in 2..=graph.n() {
+        let sol_k = solve_fixed_k(graph, k, rng, p);
+        let d     = sol_k.density();
+
+        if d + f64::EPSILON >= p.gamma_target {
+            // found γ-feasible => reset fail counter
+            consecutive_fail = 0;
+
+            // update global best
+            if k > best_sol.size() || (k == best_sol.size() && d > best_d) {
+                best_d   = d;
+                best_sol = sol_k;
+            }
+        } else {
+            // this k failed
+            consecutive_fail += 1;
+            if consecutive_fail >= 2 {
+                break; // paper stop-rule
+            }
+        }
+    }
+
+    best_sol
+}
+
+===== src\neighbour.rs =====
+//! Intensification: explore the swap neighborhood (Algorithm 1 of TSQC).
+//!
+//! In each iteration, TSQC tries to swap one vertex *u* ∈ S with one vertex *w* ∉ S. 
+//! We define set **A** as the vertices in S with minimum internal degree, and set **B** as the 
+//! vertices outside S with maximum degree (relative to S):contentReference[oaicite:62]{index=62}:contentReference[oaicite:63]{index=63}. 
+//! The algorithm selects the swap that *does not decrease* the density (Δf ≥ 0) and yields the 
+//! largest improvement if any. If no non-deteriorating swap is available (local optimum), 
+//! intensification stops. A tabu move is allowed under the **aspiration** criterion if it produces 
+//! a solution with higher density than any seen so far:contentReference[oaicite:64]{index=64}. Dual tabu lists prevent immediately 
+//! undoing the last move unless such an aspirational move occurs.
+
+use crate::{solution::Solution, tabu::DualTabu, params::Params};
+use rand::Rng;
+
+/// Apply one intensification step (one swap move) if possible. 
+/// 
+/// Examines potential swaps of one in-set vertex `u` (from the current solution) with one 
+/// out-of-set vertex `w`. The swap that yields the highest density (with **non-negative** gain in edges) 
+/// is chosen and executed. If a move is tabu, it will still be executed under the aspiration criterion 
+/// if it achieves a greater density than `global_best_density` (the best density found so far). 
+/// Returns `true` if a swap was performed (improving or equal-density move), or `false` if no allowable 
+/// swap could improve or maintain the density (i.e., a local optimum is reached).
+pub fn improve_once<'g, R>(
+    sol: &mut Solution<'g>,
+    tabu: &mut DualTabu,
+    global_best_density: f64,
+    freq: &mut [usize],
+    p: &Params,
+    rng: &mut R
+) -> bool 
+where
+    R: Rng + ?Sized,
+{
+    let g = sol.graph();
+    let k = sol.size();
+    let m = sol.edges();
+    let current_density = sol.density();
+
+    // Identify critical vertices in S (those with degree < ⌊ρ*(|S|-1)⌋ in the current solution)
+    let crit_thr = (current_density * ((k as f64) - 1.0)).floor() as usize;
+    let mut critical_vertices: Vec<usize> = Vec::new();
+    for u in sol.bitset().iter_ones() {
+        let deg_in = g.neigh_row(u)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if deg_in < crit_thr {
+            critical_vertices.push(u);
+        }
+    }
+    if critical_vertices.is_empty() {
+        // No critical vertices (solution is very dense or |S| < 2); no beneficial swap exists
+        // because any swap would likely remove a well-connected vertex.
+        // Intensification cannot find a >=0 move in this case.
+        tabu.step();  // count this as an iteration (no move made)
+        return false;
+    }
+
+    // Try all swap combinations (u in A, w outside) to find the best allowed move
+    let mut best_allowed: Option<(f64, usize, usize)> = None;
+    let mut best_aspirant: Option<(f64, usize, usize)> = None;
+    for &u in &critical_vertices {
+        // Compute loss in edges if u is removed
+        let loss_u = g.neigh_row(u)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        // Loop over all outside vertices w
+        for w in 0..g.n() {
+            if sol.bitset()[w] {
+                continue; // skip vertices already in S
+            }
+            // Compute gain in edges if w is added (count neighbors of w in current S, excluding u)
+            let gain_w = g.neigh_row(w)
+                .iter_ones()
+                .filter(|&j| j != u && sol.bitset()[j])
+                .count();
+            // Check the net effect on edge count
+            if gain_w >= loss_u {
+                // This swap does not decrease the number of edges (Δm >= 0, so Δρ >= 0 since |S| is constant)
+                let new_m = m - loss_u + gain_w;
+                let new_density = if k < 2 {
+                    0.0 
+                } else {
+                    // Compute density of the would-be solution S' after the swap
+                    2.0 * (new_m as f64) / ((k * (k - 1)) as f64)
+                };
+                let move_is_tabu = tabu.is_tabu_v(u) || tabu.is_tabu_u(w);
+                if !move_is_tabu {
+                    // Non-tabu swap candidate
+                    if best_allowed.is_none() || new_density > best_allowed.as_ref().unwrap().0 {
+                        best_allowed = Some((new_density, u, w));
+                    }
+                } else if new_density > global_best_density {
+                    // Tabu move, but qualifies under aspiration (would exceed best global density seen)
+                    if best_aspirant.is_none() || new_density > best_aspirant.as_ref().unwrap().0 {
+                        best_aspirant = Some((new_density, u, w));
+                    }
+                }
+            }
+        }
+    }
+
+    // Decide which move to execute, if any
+    let chosen_move = if let Some((_, u, w)) = best_allowed {
+        // Execute the best allowed swap (non-negative Δρ)
+        Some((u, w))
+    } else if let Some((_, u, w)) = best_aspirant {
+        // No allowed move improved density, but a tabu move can improve the global best – use aspiration
+        Some((u, w))
+    } else {
+        None
+    };
+
+    if let Some((u, w)) = chosen_move {
+        // Perform the swap: remove u from S and add w to S
+        sol.remove(u);
+        sol.add(w);
+        // Update long-term frequencies for u and w
+        freq[u] += 1;
+        if freq[u] > p.stagnation_iter as usize {  // using stagnation_iter as a safe upper bound (k times might be too strict if k is small)
+            freq.fill(0);
+        }
+        freq[w] += 1;
+        if freq[w] > p.stagnation_iter as usize {
+            freq.fill(0);
+        }
+        // Update tabu tenures based on the new solution state (|S| unchanged, but edges may change)
+        tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+        // Mark this swap in the tabu lists: 
+        // - u (just removed) is forbidden to re-enter S for Tu iterations 
+        // - w (just added) is forbidden to leave S for Tv iterations
+        tabu.forbid_v(u);
+        tabu.forbid_u(w);
+        tabu.step();  // advance the tabu list's iteration counter
+        return true;
+    } else {
+        // No swap was found that improves or maintains density – local optimum reached for now.
+        tabu.step();
+        return false;
+    }
+}
+
+// (The improve_until_local_optimum function from the original code has been removed, 
+// as we now handle the intensification loop explicitly in solve_fixed_k for better control.)
+
+===== src\params.rs =====
+//! Parameter bundle for TSQC (Tabu Search for γ-quasi-cliques).
+//!
+//! These tunable parameters control the tabu search behavior, diversification intensity, and restart criteria.
+//! 
+//! - `tenure_u` and `tenure_v` are the initial tabu tenures for removed and added vertices (adaptive updates will override them during search).
+//! - `gamma` controls the strength of heavy perturbation in the original design (fraction of the solution to replace). In our adapted implementation, heavy moves always remove 1 vertex (this parameter is unused by the current heavy perturbation logic).
+//! - `gamma_target` is the density threshold (γ) that defines a quasi-clique (feasibility target).
+//! - `stagnation_iter` is the number of consecutive non-improving iterations to tolerate before considering the search "stagnant". (In our implementation, we diversify immediately upon stagnation, so this effectively serves as an upper bound and as a safe value for frequency reset threshold).
+//! - `max_iter` is the global cap on the total number of iterations (across all restarts and moves).
+
+#[derive(Clone, Debug)]
+pub struct Params {
+    /* ─── Tabu tenure base (will be adapted dynamically) ─── */
+    pub tenure_u: usize,
+    pub tenure_v: usize,
+
+    /* ─── Diversification ─── */
+    pub gamma:        f64,   // (Unused in new heavy_perturbation) fraction of |S| to remove in original heavy perturbation
+    pub heavy_prob:   f64,   // probability of choosing heavy vs. mild diversification
+
+    /* ─── Quasi-clique feasibility goal ─── */
+    pub gamma_target: f64,   // target density γ for a quasi-clique
+
+    /* ─── Restart / search limits ─── */
+    pub stagnation_iter: usize, // stagnation threshold (L in the paper – max consecutive iterations with no improvement)
+    pub max_iter:        usize, // hard cap on total iterations (It_max)
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            tenure_u: 7,
+            tenure_v: 7,
+            // A small heavy perturbation probability by default, as TSQC applies heavy moves rarely
+            gamma:      0.50,
+            heavy_prob: 0.10,
+            /* The default gamma_target of 0.90 matches the “sparse quasi-clique” benchmark in the thesis. 
+               It can be adjusted by the caller if a different density threshold is needed. */
+            gamma_target: 0.90,
+            stagnation_iter: 1_000,
+            max_iter:        1_000_000,
+        }
+    }
+}
+
+===== src\restart.rs =====
+//! Multi-start controller: initial construction → local search → diversification → possible restart.
+//!
+//! The `solve_fixed_k` function runs the TSQC search for a fixed subset size `k`. If no γ-feasible
+//! solution is found in one run of tabu search, it **restarts** with a new initial solution generated
+//! from long-term frequency memory. This continues until a quasi-clique is found or the global
+//! iteration limit is reached, following Algorithm 2 in the thesis.
+
+use crate::{
+    construct::greedy_random_k,
+    diversify::{heavy_perturbation, mild_perturbation},
+    neighbour::improve_once,
+    params::Params,
+    solution::Solution,
+    tabu::DualTabu,
+    Graph,
+};
+use rand::seq::SliceRandom;
+use rand::Rng;
+
+/// Tabu search for a fixed subset size `k`.  
+/// Returns the best solution found (γ-feasible or densest illegal subset).
+pub fn solve_fixed_k<'g, R>(
+    graph: &'g Graph,
+    k: usize,
+    rng: &mut R,
+    p: &Params,
+) -> Solution<'g>
+where
+    R: Rng + ?Sized,
+{
+    /*────────────────── long-term frequency memory ──────────────────*/
+    let mut freq: Vec<usize> = vec![0; graph.n()];
+
+    /*────────────────── initial solution (greedy-random) ────────────*/
+    let mut best_solution = greedy_random_k(graph, k, rng);
+    let mut best_density = best_solution.density();
+
+    /*──────── global best across restarts ────────*/
+    let mut global_best = best_solution.clone();
+    let mut global_best_d = best_density;
+
+    if best_density + f64::EPSILON >= p.gamma_target {
+        return best_solution;
+    }
+
+    /*──────── counters ────────*/
+    let mut total_it = 0usize;
+
+    /*================================================================
+     * Restart loop
+     *================================================================*/
+    loop {
+        /*── tabu list for this run ─*/
+        let mut tabu = DualTabu::new(graph.n(), p.tenure_u, p.tenure_v);
+        tabu.update_tenures(
+            best_solution.size(),
+            best_solution.edges(),
+            p.gamma_target,
+            rng,
+        );
+
+        /*── current solution state ─*/
+        let mut cur = best_solution.clone();
+        let mut run_best = cur.clone();
+        let mut run_best_d = cur.density();
+        let mut stagn = 0usize;
+
+        /*============================================================
+         * Inner loop – intensification & diversification
+         *===========================================================*/
+        loop {
+            /* Intensification: one swap */
+            if improve_once(
+                &mut cur,
+                &mut tabu,
+                run_best_d,
+                &mut freq,
+                p,
+                rng,
+            ) {
+                total_it += 1;
+                let d = cur.density();
+                if d > run_best_d {
+                    run_best_d = d;
+                    run_best = cur.clone();
+                    stagn = 0;
+                } else {
+                    stagn += 1;
+                }
+
+                /* feasible? */
+                if d + f64::EPSILON >= p.gamma_target {
+                    return cur;
+                }
+                if total_it >= p.max_iter {
+                    return global_best;
+                }
+                if stagn < p.stagnation_iter {
+                    continue;
+                }
+            } else {
+                stagn += 1; // no allowable swap (local optimum)
+            }
+
+            /* Diversification on stagnation */
+            if stagn >= p.stagnation_iter {
+                if rng.gen_bool(p.heavy_prob) {
+                    heavy_perturbation(&mut cur, &mut tabu, rng, p, &mut freq);
+                } else {
+                    mild_perturbation(&mut cur, &mut tabu, rng, p, &mut freq); // <-- p toegevoegd
+                }
+                stagn = 0;
+                total_it += 1;
+                if total_it >= p.max_iter {
+                    return global_best;
+                }
+                continue; // back to intensification
+            }
+            break; // inner loop finished without diversification
+        }
+
+        /*── update global best ─*/
+        if run_best_d > global_best_d {
+            global_best_d = run_best_d;
+            global_best = run_best.clone();
+        }
+        if total_it >= p.max_iter {
+            break;
+        }
+
+        /*================================================================
+         * Build new initial solution using long-term frequency memory
+         *================================================================*/
+        // a) start vertex = least-frequent
+        let min_f = *freq.iter().min().unwrap();
+        let mut cand: Vec<usize> = (0..graph.n()).filter(|&v| freq[v] == min_f).collect();
+        cand.shuffle(rng);
+        let first = cand[0];
+
+        let mut new_sol = Solution::new(graph);
+        new_sol.add(first);
+
+        // b) greedily add vertices (highest degree, low freq)
+        while new_sol.size() < k {
+            let mut max_deg = 0usize;
+            for w in 0..graph.n() {
+                if new_sol.bitset()[w] {
+                    continue;
+                }
+                max_deg = max_deg.max(graph.degree(w));
+            }
+            let mut best_deg_verts = Vec::new();
+            for w in 0..graph.n() {
+                if new_sol.bitset()[w] || graph.degree(w) < max_deg {
+                    continue;
+                }
+                best_deg_verts.push(w);
+            }
+            if best_deg_verts.is_empty() {
+                break;
+            }
+            // prefer vertices with minimal frequency among the top-degree set
+            let min_f2 = best_deg_verts.iter().map(|&v| freq[v]).min().unwrap();
+            let mut best_choices: Vec<usize> =
+                best_deg_verts.into_iter().filter(|&v| freq[v] == min_f2).collect();
+            best_choices.shuffle(rng);
+            new_sol.add(best_choices[0]);
+        }
+
+        // c) update frequencies
+        for v in new_sol.bitset().iter_ones() {
+            freq[v] += 1;
+            if freq[v] > k {
+                freq.fill(0);
+            }
+        }
+
+        /*── prepare next run ─*/
+        best_solution = new_sol;
+        best_density = best_solution.density();
+        if best_density + f64::EPSILON >= p.gamma_target {
+            return best_solution;
+        }
+    }
+
+    /* max_iter reached */
+    global_best
+}
+
+===== src\solution.rs =====
+//! Candidate solution: a vertex subset S with cached |S| and m(S).
+//!
+//! • O(1) access to size and edge count.  
+//! • O(n / 64) per add/remove operation.  
+//! • Works together with [`Graph`] and [`DualTabu`].
+
+use bitvec::prelude::*;
+use crate::graph::Graph;
+
+/// Mutable quasi-clique candidate bound to a single [`Graph`].
+#[derive(Clone, Debug)]
+pub struct Solution<'g> {
+    graph:      &'g Graph,
+    vertices:   BitVec,
+    edge_count: usize,
+    size:       usize,
+}
+
+/*───────────────────────── impl ─────────────────────────*/
+
+impl<'g> Solution<'g> {
+    /* constructors */
+
+    /// Empty solution.
+    pub fn new(graph: &'g Graph) -> Self {
+        Self {
+            graph,
+            vertices: bitvec![0; graph.n()],
+            edge_count: 0,
+            size: 0,
+        }
+    }
+
+    /// Build from an initial bitset; computes edge count.
+    pub fn from_bitset(graph: &'g Graph, subset: &BitSlice) -> Self {
+        assert_eq!(subset.len(), graph.n());
+
+        let size = subset.count_ones();
+        let mut e = 0usize;
+        for i in 0..graph.n() {
+            if subset[i] {
+                for j in graph.neigh_row(i).iter_ones().filter(|&j| j > i) {
+                    if subset[j] { e += 1; }
+                }
+            }
+        }
+
+        let mut vertices = BitVec::repeat(false, graph.n());
+        vertices |= subset;
+
+        Self { graph, vertices, edge_count: e, size }
+    }
+
+    /* queries */
+
+    #[inline] pub fn size(&self) -> usize          { self.size }
+    #[inline] pub fn edges(&self) -> usize         { self.edge_count }
+    #[inline] pub fn bitset(&self) -> &BitVec      { &self.vertices }
+    #[inline] pub fn graph(&self) -> &Graph        { self.graph }
+
+    /// Density 2 m(S) / (|S|·(|S|−1)); returns 0 for |S| < 2.
+    pub fn density(&self) -> f64 {
+        if self.size < 2 { 0.0 }
+        else { 2.0 * self.edge_count as f64 / (self.size * (self.size - 1)) as f64 }
+    }
+
+    pub fn is_gamma_feasible(&self, gamma: f64) -> bool {
+       self.density() + f64::EPSILON >= gamma
+    }
+    /* mutators */
+
+    /// Add vertex *v* (no-op if already present).
+    pub fn add(&mut self, v: usize) {
+        if self.vertices[v] { return; }
+        let added = self.graph.neigh_row(v)
+            .iter_ones()
+            .filter(|&j| self.vertices[j])
+            .count();
+        self.vertices.set(v, true);
+        self.size       += 1;
+        self.edge_count += added;
+    }
+
+    /// Remove vertex *v* (no-op if absent).
+    pub fn remove(&mut self, v: usize) {
+        if !self.vertices[v] { return; }
+        let removed = self.graph.neigh_row(v)
+            .iter_ones()
+            .filter(|&j| self.vertices[j])
+            .count();
+        self.vertices.set(v, false);
+        self.size       -= 1;
+        self.edge_count -= removed;
+    }
+
+    /// Toggle membership; returns `true` if *v* is in the set afterwards.
+    pub fn toggle(&mut self, v: usize) -> bool {
+        if self.vertices[v] { self.remove(v); false } else { self.add(v); true }
+    }
+
+    /// Clear S completely.
+    pub fn clear(&mut self) {
+        self.vertices.fill(false);
+        self.size = 0;
+        self.edge_count = 0;
+    }
+}
+
+/*───────────────────────── tests ─────────────────────────*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn triangle_graph() -> Graph {
+        let dimacs = b"p edge 3 3\ne 1 2\ne 1 3\ne 2 3\n";
+        Graph::parse_dimacs(Cursor::new(dimacs)).unwrap()
+    }
+
+    #[test]
+    fn add_remove_consistency() {
+        let g = triangle_graph();
+        let mut sol = Solution::new(&g);
+
+        sol.add(0);
+        sol.add(1);
+        sol.add(2);
+        approx::assert_relative_eq!(sol.density(), 1.0);
+
+        sol.remove(1);
+        assert_eq!(sol.size(), 2);
+        assert_eq!(sol.edges(), 1);
+    }
+}
+
+===== src\tabu.rs =====
+//! Dual-tabu list with adaptive tenures (Section 3.4.3 of the TSQC paper).
+//!
+//! We maintain two tabu lists: 
+//! **tabu_u** for vertices recently added to S (forbidding their removal for Tv iterations), 
+//! and **tabu_v** for vertices recently removed from S (forbidding their re-addition for Tu iterations):contentReference[oaicite:83]{index=83}:contentReference[oaicite:84]{index=84}. 
+//! The tabu tenures *Tu* and *Tv* are updated dynamically based on the current solution's status (density gap and random variation):contentReference[oaicite:85]{index=85}:contentReference[oaicite:86]{index=86}. 
+//! This adaptation helps prevent the search from becoming stuck by allowing tenures to grow when far from a feasible solution and shrink when close:contentReference[oaicite:87]{index=87}.
+
+use rand::Rng;
+
+#[derive(Clone, Debug)]
+pub struct DualTabu {
+    expiry_u: Vec<usize>,  // iteration index until which vertex is forbidden to be removed (for each v in V)
+    expiry_v: Vec<usize>,  // iteration index until which vertex is forbidden to be added
+    iter:     usize,       // current global iteration count for tabu timing
+    tu:       usize,       // current tenure for removed vertices (tabu_v duration)
+    tv:       usize,       // current tenure for added vertices (tabu_u duration)
+}
+
+impl DualTabu {
+    /*────────── constructor ──────────*/
+
+    pub fn new(n: usize, initial_tu: usize, initial_tv: usize) -> Self {
+        Self {
+            expiry_u: vec![0; n],
+            expiry_v: vec![0; n],
+            iter:     0,
+            tu:       initial_tu.max(1),
+            tv:       initial_tv.max(1),
+        }
+    }
+
+    /*────────── adaptive tenure update ──────────*/
+
+    /// Recompute tabu tenures Tu and Tv based on the current solution size and edges.
+    ///
+    /// This implements the adaptive formula inspired by Wu & Hao (2013):contentReference[oaicite:88]{index=88}. 
+    /// Let *L<sub>q</sub>* be the minimum number of edges required for a size-|S| quasi-clique (γ-target edges). 
+    /// We compute `l = min{ L_q - m(S), 10 }` as the capped edge deficit. 
+    /// Then `Tu = (l + 1) + Random(0..C)` and `Tv = 0.6*(l + 1) + Random(0..0.6*C)`, where `C = max{|S|/40, 6}`. 
+    /// This means if the current solution is far from the density target (large deficit *l*), tenures increase (up to a cap), 
+    /// and if it's close to feasible, tenures stay smaller. A random component prevents cycles where all vertices become tabu:contentReference[oaicite:89]{index=89}.
+    pub fn update_tenures<R: Rng + ?Sized>(
+        &mut self, 
+        size_s: usize, 
+        edges: usize, 
+        gamma: f64, 
+        rng: &mut R
+    ) {
+        // Compute the required number of edges for a quasi-clique of size_s (ceil of γ * (size_s choose 2))
+        let clique_edges = if size_s < 2 {
+            0 
+        } else {
+            (size_s * (size_s - 1)) / 2
+        };
+        let target_edges = (gamma * (clique_edges as f64)).ceil() as usize;
+        // l = how many edges short of target (capped at 10)
+        let deficit = if target_edges > edges {
+            target_edges - edges
+        } else {
+            0
+        };
+        let l = deficit.min(10) as usize;
+        // C = max{|S|/40, 6} as an integer
+        let c = ((size_s / 40).max(6)) as usize;
+        // Randomize tenures based on l and C
+        let rand_u = rng.gen_range(0..=c);
+        let rand_v = rng.gen_range(0..=((0.6 * (c as f64)).floor() as usize));
+        // Tu = l + 1 + random(0..C)
+        self.tu = (l + 1 + rand_u).max(1);
+        // Tv = 0.6*(l + 1) + random(0..0.6*C)
+        let base_v = ((l + 1) as f64 * 0.6).floor() as usize;
+        self.tv = (base_v + rand_v).max(1);
+    }
+
+    /*────────── iteration control ──────────*/
+
+    #[inline] 
+    pub fn step(&mut self) { 
+        // Advance the global iteration counter for tabu. This should be called at the end of each iteration (move or not).
+        self.iter += 1; 
+    }
+
+    /*────────── tabu status queries ──────────*/
+
+    #[inline] 
+    pub fn is_tabu_u(&self, v: usize) -> bool {
+        // Checks if vertex v is currently forbidden to be added to S (recently removed)
+        self.expiry_u[v] > self.iter
+    }
+    #[inline] 
+    pub fn is_tabu_v(&self, v: usize) -> bool {
+        // Checks if vertex v is currently forbidden to be removed from S (recently added)
+        self.expiry_v[v] > self.iter
+    }
+
+    /*────────── mark moves as tabu ──────────*/
+
+    #[inline] 
+    pub fn forbid_u(&mut self, v: usize) {
+        // Forbid vertex v from being added back to S for the next Tu iterations
+        self.expiry_u[v] = self.iter + self.tu;
+    }
+    #[inline] 
+    pub fn forbid_v(&mut self, v: usize) {
+        // Forbid vertex v from being removed from S for the next Tv iterations
+        self.expiry_v[v] = self.iter + self.tv;
+    }
+
+    /*────────── reset after diversification ──────────*/
+
+    pub fn reset(&mut self) {
+        // Clear all tabu entries (long-term memory like frequencies remains untouched).
+        self.expiry_u.fill(0);
+        self.expiry_v.fill(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_tabu_logic() {
+        let mut t = DualTabu::new(3, 2, 3); // initial Tu=2, Tv=3
+        // iteration 0
+        assert!(!t.is_tabu_u(1));
+        t.forbid_u(1);
+        t.forbid_v(2);
+        // iteration 0: forbids take effect immediately
+        assert!( t.is_tabu_u(1));
+        assert!( t.is_tabu_v(2));
+        t.step(); // iter 1
+        assert!( t.is_tabu_u(1)); // still tabu (expiry iter ~2)
+        assert!( t.is_tabu_v(2)); // still tabu (expiry iter ~3)
+        t.step(); // iter 2
+        assert!(!t.is_tabu_u(1)); // U-tabu expired
+        assert!( t.is_tabu_v(2));  // V-tabu still active
+        t.step(); // iter 3
+        assert!(!t.is_tabu_v(2)); // V-tabu expired
+    }
+}
+
+===== tests\smoke.rs =====
+use tsqc::{Graph, Params, solve_fixed_k};
+use rand_chacha::ChaCha8Rng;
+use rand::SeedableRng;
+
+#[test]
+fn smoke_fixed_k() {
+    // 5-vertex complete graph minus one edge (2-3 missing)
+    let edges = vec![
+        (0,1),(0,2),(0,3),(0,4),
+        (1,2),(1,3),(1,4),
+        (2,4),
+        (3,4),
+    ];
+    let g = Graph::from_edge_list(5, &edges);
+
+    let mut rng = ChaCha8Rng::seed_from_u64(1);
+    let sol = solve_fixed_k(&g, 5, &mut rng, &Params::default());
+
+    // Solver should reach at least the original 0.9 density,
+    // and may reach 1.0 after improving the edge set.
+    assert!(sol.density() >= 0.9);
+}
+
+===== tsqc\__init__.py =====
+"""
+Python façade for the native Rust extension.
+
+Import order:
+1.   import tsqc         → this file
+2.   this file imports tsqc._native (compiled pyd/so)
+3.   re-exports the three PyO3 functions at top level
+"""
+
+from importlib import import_module, metadata as _md
+
+# load the shared library (tsqc/_native.*)
+_native = import_module("tsqc._native")
+
+# re-export selected symbols so callers can do:  from tsqc import solve_k_py
+solve_k_py      = _native.solve_k_py
+solve_max_py    = _native.solve_max_py
+parse_dimacs_py = _native.parse_dimacs_py
+
+__all__ = [
+    "solve_k_py",
+    "solve_max_py",
+    "parse_dimacs_py",
+]
+
+__version__ = _md.version("tsqc")
+
+# clean up internal names
+del _native, import_module, _md
+
+===== tsqc\benchmarks.py =====
+"""
+Batch-run TSQC on a folder of DIMACS graphs.
+
+Example:
+    python -m tsqc.benchmarks -d benchmarks -g 0.7,0.8,0.9 -r 3
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from typing import List
+import argparse, pandas as pd, itertools, sys
+
+from tsqc.runner import run_instance
+
+
+def parse_gamma_list(s: str) -> List[float]:
+    return [float(x) for x in s.split(",") if x.strip()]
+
+
+def benchmark_dimacs(
+    dimacs_dir: Path,
+    pattern: str,
+    gammas: List[float],
+    runs: int,
+    k_target: int | None,
+) -> pd.DataFrame:
+    """
+    Run TSQC over every file matching pattern × every γ.
+    Keeps the best run per (file, γ).
+    """
+    rows = []
+    files = sorted(dimacs_dir.glob(pattern))
+    total = len(files) * len(gammas)
+    print(f"Benchmarking {total} combos …\n")
+
+    for file_path, gamma in itertools.product(files, gammas):
+        if file_path.name.startswith("._"):  # macOS junk
+            continue
+        print(f"→ {file_path.name}  γ={gamma}")
+        res = run_instance(file_path, gamma, runs=runs, k_target=k_target)
+        rows.append(res)
+
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────── CLI ────────────────────────────
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser("TSQC DIMACS benchmark")
+    parser.add_argument("-d", "--dir",      type=Path, required=True)
+    parser.add_argument("-p", "--pattern",  default="*.clq")
+    parser.add_argument("-g", "--gammas",   required=True,
+                        help="Comma-sep list, e.g. 0.7,0.8")
+    parser.add_argument("-r", "--runs",     type=int, default=1,
+                        help="Independent runs each combo")
+    parser.add_argument("-k", "--k",        type=int,
+                        help="Fixed size k instead of any-k search")
+    parser.add_argument("-o", "--out",      type=Path,
+                        default=Path("benchmark_results.csv"))
+    args = parser.parse_args(argv)
+
+    df = benchmark_dimacs(
+        args.dir, args.pattern,
+        parse_gamma_list(args.gammas),
+        args.runs, args.k,
+    )
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.out, index=False)
+    print(f"\n✓ Results saved -> {args.out}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main(sys.argv[1:])
+
+===== tsqc\data_loader.py =====
+"""
+Fast DIMACS loader that delegates parsing to Rust when the compiled
+`tsqc` wheel is available.  Falls back to pure-Python parsing if the Rust
+symbol isn't present (e.g. during first `cargo test` before building the
+wheel).
+
+Usage:
+    from tsqc.data_loader import load_dimacs
+    n, edges = load_dimacs(Path("benchmarks/hamming8-4.clq"))
+"""
+
+from pathlib import Path
+from typing import List, Tuple
+
+try:
+    # when the wheel is installed, this is the ultra-fast Rust parser
+    from tsqc import parse_dimacs_py   # PyO3 export
+except ImportError:
+    parse_dimacs_py = None
+
+
+# ---------------------------------------------------------------------------
+def _python_dimacs(path: Path) -> Tuple[int, List[Tuple[int, int]]]:
+    """Portable fallback DIMACS parser (line-by-line, ASCII)."""
+    n_vertices = 0
+    edges: List[Tuple[int, int]] = []
+
+    with path.open("r", encoding="utf8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("c"):
+                continue
+            if line.startswith("p"):
+                # line: 'p edge <n> <m>'
+                parts = line.split()
+                if len(parts) >= 3:
+                    n_vertices = int(parts[2])
+            elif line.startswith("e"):
+                # line: 'e <u> <v>'  (1-based indices)
+                parts = line.split()
+                if len(parts) >= 3:
+                    u = int(parts[1]) - 1
+                    v = int(parts[2]) - 1
+                    edges.append((u, v))
+
+    return n_vertices, edges
+
+
+# ---------------------------------------------------------------------------
+def load_dimacs(path: Path) -> Tuple[int, List[Tuple[int, int]]]:
+    """
+    Returns (n_vertices, edge_list with 0-based indices).
+    Tries the Rust backend first for speed, otherwise uses Python fallback.
+    """
+    if parse_dimacs_py is not None:
+        return parse_dimacs_py(str(path))
+    return _python_dimacs(path)
+
+===== tsqc\dump_tree.py =====
+#!/usr/bin/env python
+"""
+Create a single-file snapshot of the project tree without duplicate paths.
+
+Examples
+--------
+# dump only the real source tree
+python tools/dump_tree.py -o snapshot.txt -i src
+
+# default (whole project, but unique relative paths)
+python tools/dump_tree.py
+"""
+from pathlib import Path
+import mimetypes, argparse, textwrap, sys
+
+# ─────────────────────────────────────────────────────────────────────────────
+EXCLUDE_DIRS = {
+    ".git", ".venv", "target", ".github", "dist", "build",
+    "__pycache__", ".idea", ".vscode", "_old", "backup", ".history",
+    ".ipynb_checkpoints", ".txt",
+}
+ALLOWED_EXTS = {".py", ".rs", ".toml", ".json", ".md", ".txt", ".yml", ".yaml"}
+MAX_BYTES_DEFAULT  = 100_000   # skip huge generated files
+MAX_LINES_DEFAULT  = 4_000
+# ─────────────────────────────────────────────────────────────────────────────
+
+def excluded(path: Path) -> bool:
+    return any(part in EXCLUDE_DIRS for part in path.parts)
+
+def looks_text(path: Path) -> bool:
+    mime, _ = mimetypes.guess_type(path)
+    return mime is None or mime.startswith("text/") or mime.endswith("+json")
+
+def dump_project(out: Path, root: Path,
+                 include_glob: str | None,
+                 max_bytes: int, max_lines: int):
+    seen: set[str] = set()
+    dumped   = 0
+    skipped  = 0
+
+    with out.open("w", encoding="utf-8") as fh:
+        files = sorted(root.rglob("*"))
+        if include_glob:
+            files = [p for p in files if p.match(include_glob)]
+
+        for p in files:
+            if p.is_dir() or excluded(p):
+                continue
+            if p.suffix.lower() not in ALLOWED_EXTS:
+                continue
+            rel = str(p.relative_to(root))
+            if rel in seen:
+                skipped += 1
+                continue
+            seen.add(rel)
+
+            if not looks_text(p) or p.stat().st_size > max_bytes:
+                continue
+
+            fh.write(f"{'='*5} {rel} {'='*5}\n")
+            try:
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception as e:
+                fh.write(f"[skip: {e}]\n\n")
+                continue
+
+            if len(lines) > max_lines:
+                lines = lines[:max_lines] + [f"... ({len(lines)-max_lines} lines truncated)"]
+            fh.write("\n".join(lines) + "\n\n")
+            dumped += 1
+
+    print(f"Snapshot written to {out}  ({dumped} files, {skipped} duplicates skipped)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main(argv: list[str] | None = None):
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=textwrap.dedent("""\
+            Dump all text source files into a single txt while ignoring duplicates.
+
+            Typical usage:
+              python tools/dump_tree.py -i src          # only real code
+              python tools/dump_tree.py -o snapshot.txt # whole repo
+        """))
+    ap.add_argument("-o", "--output", default="project_snapshot.txt",
+                    help="Output file (default: %(default)s)")
+    ap.add_argument("-i", "--include", metavar="GLOB", default=None,
+                    help="Only include paths matching this glob (e.g. 'src/**')")
+    ap.add_argument("-n", "--lines", type=int, default=MAX_LINES_DEFAULT,
+                    help="Max lines per file (default: %(default)s)")
+    ap.add_argument("-b", "--bytes", type=int, default=MAX_BYTES_DEFAULT,
+                    help="Max file size in bytes (default: %(default)s)")
+    args = ap.parse_args(argv)
+
+    dump_project(Path(args.output), Path.cwd(),
+                 args.include, args.bytes, args.lines)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
+===== tsqc\runner.py =====
+"""
+Streaming TSQC runner – toont live voortgang.
+
+Elke run:
+    1) print een placeholder "… searching …"
+    2) voert Rust-solver uit
+    3) overschrijft de regel met definitieve gegevens
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from time import perf_counter
+import argparse, statistics, sys
+from typing import Tuple
+
+from tsqc import solve_max_py, solve_k_py, parse_dimacs_py
+
+
+def edges_from_density(k: int, rho: float) -> int:
+    return int(round(rho * (k * (k - 1) / 2))) if k > 1 else 0
+
+
+def single_run(path: Path, gamma: float, k: int | None, seed: int) -> Tuple[int, int, float, float]:
+    t0 = perf_counter()
+    if k is None:
+        size, rho = solve_max_py(str(path), gamma, seed)
+    else:
+        rho  = solve_k_py(str(path), k, gamma, seed)
+        size = k
+    sec   = perf_counter() - t0
+    edges = edges_from_density(size, rho)
+    return size, edges, rho, sec
+
+
+def better(a, b):
+    """a is better than b?  (size desc, edges desc, sec asc)."""
+    return (a[0], a[1], -a[3]) > (b[0], b[1], -b[3])
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser("TSQC runner (live)")
+    ap.add_argument("-i", "--instance", type=Path, required=True)
+    ap.add_argument("-g", "--gamma",    type=float, default=0.90)
+    ap.add_argument("-r", "--runs",     type=int,   default=1)
+    ap.add_argument("-k", "--k",        type=int)
+    ap.add_argument("-s", "--seed",     type=int,   default=42)
+    args = ap.parse_args(argv)
+
+    n, m = parse_dimacs_py(str(args.instance))
+    mode = f"fixed k={args.k}" if args.k else "max-k"
+    header = f"{args.instance.name}: n={n} m={m} mode={mode} γ={args.gamma}"
+    print(header)
+    print("run  size  edges  density     sec")
+
+    best = None
+    all_rho, all_sec = [], []
+
+    for r in range(1, args.runs + 1):
+        # ── placeholder ──────────────────────────────────────────────
+        placeholder = f"{r:>3}   …   …    ……….     …"
+        print(placeholder, end="\r", flush=True)
+
+        # ── run solver ───────────────────────────────────────────────
+        size, edges, rho, sec = single_run(args.instance, args.gamma, args.k, args.seed + r - 1)
+        all_rho.append(rho)
+        all_sec.append(sec)
+
+        # ── overwrite line with real data ───────────────────────────
+        line = f"{r:>3} {size:>5} {edges:>6}  {rho:7.4f}  {sec:7.2f}"
+        print(line + " " * max(0, len(placeholder) - len(line)))  # clean remainder
+
+        cur = (size, edges, rho, sec, r)
+        if best is None or better(cur, best):
+            best = cur
+
+    # ── summary ─────────────────────────────────────────────────────
+    print(f"\nbest: run {best[4]}  size {best[0]}  edges {best[1]}  density {best[2]:.4f}")
+    if args.runs > 1:
+        avg_rho = statistics.mean(all_rho)
+        std_rho = statistics.stdev(all_rho) if args.runs > 2 else 0
+        print("avg density", f"{avg_rho:.4f} ± {std_rho:.4f}",
+              "   avg sec", f"{statistics.mean(all_sec):.2f}")
+
+
+if __name__ == "__main__":      # pragma: no cover
+    main(sys.argv[1:])
+

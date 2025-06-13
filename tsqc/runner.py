@@ -1,95 +1,86 @@
 """
-Run the Rust TSQC solver on one DIMACS instance.
+Streaming TSQC runner – toont live voortgang.
 
-Modes
------
-1. Any-k search        (default)
-2. Fixed k             (--k N)
+Elke run:
+    1) print een placeholder "… searching …"
+    2) voert Rust-solver uit
+    3) overschrijft de regel met definitieve gegevens
 """
 
 from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Optional
+import argparse, statistics, sys
+from typing import Tuple
 
-# PyO3 exports from the compiled extension -----------------
-from tsqc import solve_k_py, solve_max_py
-from tsqc.data_loader import load_dimacs
-
-
-def run_instance(
-    path: Path,
-    gamma: float,
-    runs: int = 1,
-    k_target: Optional[int] = None,
-    seed_base: int = 42,
-) -> Dict[str, Any]:
-    """
-    Execute TSQC *runs* times on a DIMACS file and keep the best result.
-
-    Returns a JSON-ready dict with:
-        {instance, gamma, n_vertices, n_edges,
-         best_size, density, time_s}
-    """
-    n_vertices, edge_list = load_dimacs(path)
-
-    best_size: int = -1
-    best_density: float = 0.0
-    best_time: float = float("inf")
-
-    for i in range(runs):
-        seed = seed_base + i
-        start = perf_counter()
-
-        if k_target is None:
-            # ---------- any-k search ----------
-            size, density = solve_max_py(edge_list, n_vertices, gamma, seed)
-        else:
-            # ---------- fixed-k search ----------
-            density = solve_k_py(edge_list, n_vertices, k_target, gamma, seed)
-            size = k_target
-
-        elapsed = perf_counter() - start
-
-        if density > best_density or (density == best_density and elapsed < best_time):
-            best_density = density
-            best_size = size
-            best_time = elapsed
-
-    return {
-        "instance":   path.name,
-        "gamma":      gamma,
-        "n_vertices": n_vertices,
-        "n_edges":    len(edge_list),
-        "best_size":  best_size,
-        "density":    best_density,
-        "time_s":     best_time,
-    }
+from tsqc import solve_max_py, solve_k_py, parse_dimacs_py
 
 
-# ─────────────────────────── CLI ────────────────────────────
-if __name__ == "__main__":  # pragma: no cover
-    import argparse, json
+def edges_from_density(k: int, rho: float) -> int:
+    return int(round(rho * (k * (k - 1) / 2))) if k > 1 else 0
 
-    parser = argparse.ArgumentParser("Run TSQC on one DIMACS instance")
-    parser.add_argument("-i", "--instance", type=Path, required=True)
-    parser.add_argument("-g", "--gamma",   type=float, required=True,
-                        help="Target density threshold γ (0<γ≤1)")
-    parser.add_argument("-r", "--runs",    type=int,   default=1,
-                        help="Independent runs for the same parameters")
-    parser.add_argument("-k", "--k",       type=int,
-                        help="Fix subset size instead of any-k search")
-    parser.add_argument("-s", "--seed",    type=int,   default=42,
-                        help="Base RNG seed (incremented per run)")
-    parser.add_argument("-o", "--out",     type=Path,
-                        help="Write JSON result to file")
-    args = parser.parse_args()
 
-    res = run_instance(args.instance, args.gamma, args.runs, args.k, args.seed)
-
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(res, indent=2))
-        print(f"✓ saved → {args.out}")
+def single_run(path: Path, gamma: float, k: int | None, seed: int) -> Tuple[int, int, float, float]:
+    t0 = perf_counter()
+    if k is None:
+        size, rho = solve_max_py(str(path), gamma, seed)
     else:
-        print(json.dumps(res, indent=2))
+        rho  = solve_k_py(str(path), k, gamma, seed)
+        size = k
+    sec   = perf_counter() - t0
+    edges = edges_from_density(size, rho)
+    return size, edges, rho, sec
+
+
+def better(a, b):
+    """a is better than b?  (size desc, edges desc, sec asc)."""
+    return (a[0], a[1], -a[3]) > (b[0], b[1], -b[3])
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser("TSQC runner (live)")
+    ap.add_argument("-i", "--instance", type=Path, required=True)
+    ap.add_argument("-g", "--gamma",    type=float, default=0.90)
+    ap.add_argument("-r", "--runs",     type=int,   default=1)
+    ap.add_argument("-k", "--k",        type=int)
+    ap.add_argument("-s", "--seed",     type=int,   default=42)
+    args = ap.parse_args(argv)
+
+    n, m = parse_dimacs_py(str(args.instance))
+    mode = f"fixed k={args.k}" if args.k else "max-k"
+    header = f"{args.instance.name}: n={n} m={m} mode={mode} γ={args.gamma}"
+    print(header)
+    print("run  size  edges  density     sec")
+
+    best = None
+    all_rho, all_sec = [], []
+
+    for r in range(1, args.runs + 1):
+        # ── placeholder ──────────────────────────────────────────────
+        placeholder = f"{r:>3}   …   …    ……….     …"
+        print(placeholder, end="\r", flush=True)
+
+        # ── run solver ───────────────────────────────────────────────
+        size, edges, rho, sec = single_run(args.instance, args.gamma, args.k, args.seed + r - 1)
+        all_rho.append(rho)
+        all_sec.append(sec)
+
+        # ── overwrite line with real data ───────────────────────────
+        line = f"{r:>3} {size:>5} {edges:>6}  {rho:7.4f}  {sec:7.2f}"
+        print(line + " " * max(0, len(placeholder) - len(line)))  # clean remainder
+
+        cur = (size, edges, rho, sec, r)
+        if best is None or better(cur, best):
+            best = cur
+
+    # ── summary ─────────────────────────────────────────────────────
+    print(f"\nbest: run {best[4]}  size {best[0]}  edges {best[1]}  density {best[2]:.4f}")
+    if args.runs > 1:
+        avg_rho = statistics.mean(all_rho)
+        std_rho = statistics.stdev(all_rho) if args.runs > 2 else 0
+        print("avg density", f"{avg_rho:.4f} ± {std_rho:.4f}",
+              "   avg sec", f"{statistics.mean(all_sec):.2f}")
+
+
+if __name__ == "__main__":      # pragma: no cover
+    main(sys.argv[1:])

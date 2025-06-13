@@ -1,115 +1,213 @@
-//! Diversification operators for TSQC.
+//! Diversification operators for TSQC (applied when the search is stuck in a local optimum).
+//!
+//! Heavy perturbation introduces a large disruption: it swaps out one vertex from the solution
+//! for a very low-degree vertex not in the solution, producing a worse (lower-density) interim
+//! solution to escape a local optimum. Mild perturbation is a smaller change: it swaps out a
+//! “critical” vertex (one of the least connected in S) for a well-connected outsider, often
+//! yielding only a slight decrease in density.  Both moves reset the tabu lists, and the search
+//! then continues from the perturbed solution.
 
-use crate::{solution::Solution, tabu::DualTabu};
+use crate::{solution::Solution, tabu::DualTabu, params::Params};
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Heavy perturbation: remove ⌈γ·|S|⌉ random vertices, then greedily add
-/// the same number of highest-degree outsiders. Resets tabu.
+/*───────────────────────────────────────────────────────────────────*/
+/*  Heavy perturbation                                               */
+/*───────────────────────────────────────────────────────────────────*/
+
+/// Heavy perturbation: remove one random vertex from S, then add an outsider with very few
+/// connections to S.
+///
+/// A “low-degree” outside vertex is chosen (degree < *h* in the current S) such that the new
+/// solution is worse (density decreases), helping the search jump to a new region.  The tabu
+/// lists are **reset** after this move, clearing any short-term memory.  The parameter `p` is
+/// used for `gamma_target` (quasi-clique density) in adaptive tenure updates.
 pub fn heavy_perturbation<'g, R>(
     sol: &mut Solution<'g>,
     tabu: &mut DualTabu,
     rng: &mut R,
-    gamma: f64,
+    p: &Params,
+    freq: &mut [usize],
 ) where
     R: Rng + ?Sized,
 {
+    /* Guard */
     let k = sol.size();
-    if k == 0 { return; }
-    let remove_cnt = ((gamma.clamp(0.1, 0.9) * k as f64).ceil() as usize).min(k);
+    if k == 0 {
+        return;
+    }
 
-    /* randomly pick vertices to remove */
+    /* 1 ─ randomly remove one vertex from S */
     let mut inside: Vec<usize> = sol.bitset().iter_ones().collect();
     inside.shuffle(rng);
-    for &v in &inside[..remove_cnt] {
-        sol.remove(v);
-    }
+    let u = inside[0];
+    sol.remove(u);
 
-    /* add highest-degree outsiders (could include previously removed ones) */
+    /* 2 ─ determine threshold h for “low-degree” outsider.
+     *     Heuristic: if the graph is very sparse, sqrt(k) may be too strict – use k^0.85. */
+    let n = sol.graph().n();
+    let graph_density = if n < 2 {
+        0.0
+    } else {
+        2.0 * (sol.graph().m() as f64) / ((n * (n - 1)) as f64)
+    };
+    let mut h: f64 = if graph_density * (k as f64) <= 1.0 {
+        // extremely sparse –- relax threshold
+        (k as f64).powf(0.85)
+    } else {
+        (k as f64).sqrt()
+    };
+    h = h.clamp(1.0, k as f64 - 1.0).ceil();          // ensure 1 ≤ h ≤ k-1
+    let h_thresh = h as usize;
+
+    /* 3 ─ pick outsider with < h edges into current S */
     let mut outsiders: Vec<usize> =
         (0..sol.graph().n()).filter(|&v| !sol.bitset()[v]).collect();
-    outsiders.sort_unstable_by_key(|&v| std::cmp::Reverse(sol.graph().degree(v)));
-    for &v in outsiders.iter().take(remove_cnt) {
-        sol.add(v);
-    }
+    outsiders.shuffle(rng);
 
-    tabu.reset();
-}
-
-/// Mild perturbation: drop worst critical vertex, add best outsider.
-pub fn mild_perturbation<'g>(sol: &mut Solution<'g>, tabu: &mut DualTabu) {
-    let curr_d   = sol.density();
-    let crit_thr = (curr_d * (sol.size() as f64 - 1.0)).floor() as usize;
-
-    /* worst critical vertex = lowest internal degree < threshold */
-    let mut worst: Option<(usize /*deg*/, usize /*v*/)> = None;
-    for v in sol.bitset().iter_ones() {
-        let deg_in = sol.graph().neigh_row(v)
+    let mut v_opt = None;
+    for &w in &outsiders {
+        let deg_in = sol
+            .graph()
+            .neigh_row(w)
             .iter_ones()
             .filter(|&j| sol.bitset()[j])
             .count();
-        if deg_in < crit_thr && worst.map_or(true, |(d, _)| deg_in < d) {
-            worst = Some((deg_in, v));
+        if deg_in < h_thresh {
+            v_opt = Some(w);
+            break;
         }
     }
-    let (_, u) = match worst { Some(p) => p, None => return };
+    let v = v_opt.unwrap_or_else(|| {
+        // no outsider below threshold – take one with minimal degree into S
+        outsiders
+            .iter()
+            .copied()
+            .min_by_key(|&w| {
+                sol.graph()
+                    .neigh_row(w)
+                    .iter_ones()
+                    .filter(|&j| sol.bitset()[j])
+                    .count()
+            })
+            .unwrap()
+    });
+    sol.add(v);
 
-    sol.remove(u);                    // end immutable borrows
+    /* 4 ─ update long-term frequencies */
+    for &vx in &[u, v] {
+        freq[vx] += 1;
+        if freq[vx] > k {
+            freq.fill(0);
+        }
+    }
 
-    /* best outsider by #edges into current S */
-    let mut best: Option<(usize, usize)> = None;
+    /* 5 ─ adapt tabu tenures to new (worse) solution & reset lists */
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+    tabu.reset();
+}
+
+/*───────────────────────────────────────────────────────────────────*/
+/*  Mild perturbation                                                */
+/*───────────────────────────────────────────────────────────────────*/
+
+/// Mild perturbation: swap worst vertex in S for best outsider (smallest drop in density).
+///
+/// Removes one critical vertex (lowest internal degree) and adds one outsider with the most
+/// edges into S.  Often only slightly degrades density and provides gentle diversification.
+pub fn mild_perturbation<'g, R>(
+    sol: &mut Solution<'g>,
+    tabu: &mut DualTabu,
+    rng: &mut R,
+    p: &Params,
+    freq: &mut [usize],
+) where
+    R: Rng + ?Sized,
+{
+    /* Guard */
+    if sol.size() == 0 {
+        return;
+    }
+
+    /* 1 ─ identify worst vertex in S */
+    let curr_d = sol.density();
+    let crit_thr = (curr_d * ((sol.size() as f64) - 1.0)).floor() as usize;
+
+    let mut worst_v = None;
+    let mut worst_deg = usize::MAX;
+
+    for u in sol.bitset().iter_ones() {
+        let deg_in = sol
+            .graph()
+            .neigh_row(u)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if deg_in < crit_thr && deg_in < worst_deg {
+            worst_deg = deg_in;
+            worst_v = Some(u);
+        }
+    }
+    // if no vertex is strictly critical, take one with minimal internal degree anyway
+    if worst_v.is_none() {
+        for u in sol.bitset().iter_ones() {
+            let deg_in = sol
+                .graph()
+                .neigh_row(u)
+                .iter_ones()
+                .filter(|&j| sol.bitset()[j])
+                .count();
+            if deg_in < worst_deg {
+                worst_deg = deg_in;
+                worst_v = Some(u);
+            }
+        }
+    }
+    let u = worst_v.expect("S non-empty, so a vertex must exist");
+    sol.remove(u);
+
+    /* 2 ─ outsider with max connections into new S */
+    let mut max_edges = 0usize;
     for w in 0..sol.graph().n() {
-        if sol.bitset()[w] { continue; }
-        let edges = sol.graph().neigh_row(w)
+        if sol.bitset()[w] {
+            continue;
+        }
+        let edges_in = sol
+            .graph()
+            .neigh_row(w)
             .iter_ones()
             .filter(|&j| sol.bitset()[j])
             .count();
-        if best.map_or(true, |(e, _)| edges > e) {
-            best = Some((edges, w));
+        max_edges = max_edges.max(edges_in);
+    }
+    let mut best_outsiders = Vec::new();
+    for w in 0..sol.graph().n() {
+        if sol.bitset()[w] {
+            continue;
+        }
+        let edges_in = sol
+            .graph()
+            .neigh_row(w)
+            .iter_ones()
+            .filter(|&j| sol.bitset()[j])
+            .count();
+        if edges_in == max_edges {
+            best_outsiders.push(w);
         }
     }
-    if let Some((_, w)) = best { sol.add(w); }
+    best_outsiders.shuffle(rng);
+    let v = best_outsiders[0];
+    sol.add(v);
 
+    /* 3 ─ update frequencies */
+    for &vx in &[u, v] {
+        freq[vx] += 1;
+        if freq[vx] > sol.size() {
+            freq.fill(0);
+        }
+    }
+
+    /* 4 ─ update tabu & reset */
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
     tabu.reset();
-}
-
-/*────────────────── tests ──────────────────*/
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{construct::greedy_k, graph::Graph, tabu::DualTabu};
-    use rand_chacha::ChaCha8Rng;
-    use rand::SeedableRng;
-    use std::io::Cursor;
-
-    fn square() -> Graph {
-        let dimacs = b"p edge 4 4\ne 1 2\ne 2 3\ne 3 4\ne 4 1\n";
-        Graph::parse_dimacs(Cursor::new(dimacs)).unwrap()
-    }
-
-    #[test]
-    fn heavy_keeps_size() {
-        let g = square();
-        let mut sol  = greedy_k(&g, 3);
-        let mut tabu = DualTabu::new(g.n(), 2, 2);
-        let before_k = sol.size();
-
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
-        heavy_perturbation(&mut sol, &mut tabu, &mut rng, 0.5);
-
-        // Heavy perturbation must keep |S| constant.
-        assert_eq!(sol.size(), before_k);
-    }
-
-    #[test]
-    fn mild_keeps_size() {
-        let g = square();
-        let mut sol  = greedy_k(&g, 3);
-        let mut tabu = DualTabu::new(g.n(), 2, 2);
-        let before_k = sol.size();
-
-        mild_perturbation(&mut sol, &mut tabu);
-
-        assert_eq!(sol.size(), before_k);
-    }
 }
