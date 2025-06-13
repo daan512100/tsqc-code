@@ -1,0 +1,12 @@
+# Rust
+/target
+
+# Python
+.venv/
+/dist/
+/build/
+/*.pyd
+/*.so
+
+# VS Code
+.vscode/

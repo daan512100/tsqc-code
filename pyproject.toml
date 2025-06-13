@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tsqc"
+version = "0.1.0"
+authors = [{ name = "<your-name>", email = "<you>@example.com" }]
+description = "Rust implementation of the TSQC heuristic with PyO3 bindings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE-MIT" }
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+]

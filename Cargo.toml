@@ -1,0 +1,21 @@
+[package]
+name = "tsqc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# ───────────── add this block ─────────────
+[lib]
+crate-type = ["cdylib"]       # tells Cargo to build a shared library
+# ──────────────────────────────────────────
+
+[dependencies]
+# ───────────── add this line ──────────────
+pyo3 = { version = "0.25.1", features = ["extension-module"] }
+
+# ──────────────────────────────────────────
+
+# (optional) feature switch so `cargo check` stays small:
+[features]
+default = []
+python   = ["pyo3/extension-module"]
