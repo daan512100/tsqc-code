@@ -1,7 +1,29 @@
-"""Thin Python façade for the native `tsqc` extension."""
-from importlib import metadata as _md, import_module as _im
+"""
+Python façade for the native Rust extension.
 
-_im("tsqc.tsqc")           # loads the compiled *.pyd/.so into this package
+Import order:
+1.   import tsqc         → this file
+2.   this file imports tsqc._native (compiled pyd/so)
+3.   re-exports the three PyO3 functions at top level
+"""
+
+from importlib import import_module, metadata as _md
+
+# load the shared library (tsqc/_native.*)
+_native = import_module("tsqc._native")
+
+# re-export selected symbols so callers can do:  from tsqc import solve_k_py
+solve_k_py      = _native.solve_k_py
+solve_max_py    = _native.solve_max_py
+parse_dimacs_py = _native.parse_dimacs_py
+
+__all__ = [
+    "solve_k_py",
+    "solve_max_py",
+    "parse_dimacs_py",
+]
 
 __version__ = _md.version("tsqc")
-del _md, _im
+
+# clean up internal names
+del _native, import_module, _md

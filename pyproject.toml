@@ -5,12 +5,15 @@ build-backend = "maturin"
 [project]
 name = "tsqc"
 version = "0.1.0"
-authors = [{ name = "<your-name>", email = "<you>@example.com" }]
-description = "Rust implementation of the TSQC heuristic with PyO3 bindings"
-readme = "README.md"
+description = "Tabu Search for Quasi-Cliques (Rust core, Python bindings)"
 requires-python = ">=3.9"
-license = { file = "LICENSE-MIT" }
-classifiers = [
-  "Programming Language :: Rust",
-  "Programming Language :: Python :: 3",
-]
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+
+[tool.maturin]
+#  The compiled extension will be installed as tsqc/_native.* (pyd/so)
+module-name     = "tsqc._native"
+#  Include the entire pure-Python package in the wheel
+python-packages = ["tsqc"]
+#  Build in release mode by default when 'maturin develop -r' is used
