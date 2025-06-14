@@ -1,88 +1,84 @@
-//! Outer “max-k” search with a tight degree-upper-bound check.
+//! Outer **max-k** search for TSQC (Algorithm 1).
 //!
-//! We iterate k = 2 … n.  For each k we first test whether the graph
-//! *could* in principe contain a γ-quasi-clique of size k by comparing
-//! a fast degree upper bound with the required number of edges.  If the
-//! answer is “no”, we skip the expensive tabu search for that k.
+//! 1.  Build a greedy γ-feasible subset S₀  →  *k_lb* = |S₀|  
+//! 2.  For k = k_lb, k_lb+1, …  
+//!       • Skip k if a degree upper-bound proves impossibility.  
+//!       • Otherwise call `solve_fixed_k` (tabu search).  
+//!       • If k > best_size **and** infeasible  →  stop (first failure above best).  
+//! 3.  Return the largest γ-quasi-clique found.
 
-use crate::{params::Params, restart::solve_fixed_k, solution::Solution, Graph};
+use crate::{
+    construct::greedy_until_gamma,
+    params::Params,
+    restart::solve_fixed_k,
+    solution::Solution,
+    Graph,
+};
 use rand::Rng;
 
-/*───────────────────────────────────────────────────────────────────────*/
-/*  Pre-compute degree prefix sums                                       */
-/*───────────────────────────────────────────────────────────────────────*/
+/*───────────────────────────────────────────────────────────*/
+/*  Degree upper-bound UB(k) = ½ Σ₀^{k-1} min{dᵢ, k-1}        */
+/*───────────────────────────────────────────────────────────*/
 
-fn degree_prefix_sums(graph: &Graph) -> Vec<usize> {
-    let mut degs: Vec<usize> = (0..graph.n()).map(|v| graph.degree(v)).collect();
-    degs.sort_unstable_by(|a, b| b.cmp(a));          // dalend
-    let mut pref = Vec::with_capacity(degs.len() + 1);
+fn degree_prefix(graph: &Graph) -> Vec<usize> {
+    let mut deg: Vec<usize> = (0..graph.n()).map(|v| graph.degree(v)).collect();
+    deg.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    let mut pref = Vec::with_capacity(deg.len() + 1);
     pref.push(0);
-    let mut acc = 0usize;
-    for d in degs {
-        acc += d;
-        pref.push(acc);
+    let mut s = 0usize;
+    for d in deg {
+        s += d;
+        pref.push(s);
     }
-    pref                                                 // pref[k] = som top-k graden
+    pref // pref[i] = Σ d₀..d_{i-1}
 }
 
-/* Upper-bound op #randen in een willekeurige k-subset */
 #[inline]
 fn ub_edges(prefix: &[usize], k: usize) -> usize {
-    // Σ min{deg_i, k-1}  i=0..k-1
-    // = Σ deg_i  −  Σ max(0, deg_i − (k-1))
-    // Maar eenvoudiger: iterate top-k: cap at k-1
-    let mut sum = 0usize;
+    let mut s = 0usize;
     for i in 0..k {
-        let capped = prefix[i + 1] - prefix[i];
-        sum += capped.min(k - 1);
+        let d_i = prefix[i + 1] - prefix[i];
+        s += d_i.min(k - 1);
     }
-    sum / 2                                             // iedere rand wordt twee keer geteld
+    s / 2
 }
 
-/*───────────────────────────────────────────────────────────────────────*/
-/*  Publieke solver                                                     */
-/*───────────────────────────────────────────────────────────────────────*/
+/*───────────────────────────────────────────────────────────*/
+/*  Public driver                                            */
+/*───────────────────────────────────────────────────────────*/
 
 pub fn solve_maxk<'g, R>(graph: &'g Graph, rng: &mut R, p: &Params) -> Solution<'g>
 where
     R: Rng + ?Sized,
 {
-    let pref = degree_prefix_sums(graph);
+    /* 1 ─ greedy γ-feasible lower bound */
+    let mut best_sol = greedy_until_gamma(graph, p.gamma_target, rng);
+    let k_lb         = best_sol.size();
 
-    let mut best_sol = Solution::new(graph);
-    let mut best_d   = 0.0;
-    let mut consecutive_fail = 0usize;
+    /* 2 ─ degree upper-bound table */
+    let pref = degree_prefix(graph);
 
-    for k in 2..=graph.n() {
-        /*──────── quick impossibility check ────────*/
-        let need_edges = ((p.gamma_target * (k * (k - 1) / 2) as f64).ceil()) as usize;
-        let ub = ub_edges(&pref, k);
-        if ub < need_edges {
-            consecutive_fail += 1;
-            if consecutive_fail >= 2 {
-                break;                     // paper stop-regel
-            }
-            continue;                      // ga naar volgend k
+    for k in k_lb..=graph.n() {
+        eprintln!("k = {}", k);
+        if k == best_sol.size() {
+            continue; // already feasible at this size
         }
 
-        /*──────── dure tabu-search ────────*/
-        let sol_k = solve_fixed_k(graph, k, rng, p);
-        let d     = sol_k.density();
-
-        if d + f64::EPSILON >= p.gamma_target {
-            consecutive_fail = 0;          // success
-            if k > best_sol.size() || (k == best_sol.size() && d > best_d) {
-                best_d   = d;
-                best_sol = sol_k;
-            }
-        } else {
+        // quick impossibility check
+        let required = ((p.gamma_target * (k * (k - 1) / 2) as f64).ceil()) as usize;
+        if ub_edges(&pref, k) < required {
             if k > best_sol.size() {
-             break;             
-          }
-            consecutive_fail += 1;
-            if consecutive_fail >= 2 {
-                break;
+                break; // first failure above best size  → stop
             }
+            continue;
+        }
+
+        // expensive tabu search
+        let sol_k = solve_fixed_k(graph, k, rng, p);
+        if sol_k.density() + f64::EPSILON >= p.gamma_target {
+            best_sol = sol_k; // update best
+        } else if k > best_sol.size() {
+            break; // first infeasible k above best size
         }
     }
 

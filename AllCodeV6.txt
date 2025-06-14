@@ -1,4 +1,4 @@
-===== AllCodeV4.txt =====
+===== AllCodeV6.txt =====
 
 
 ===== Cargo.toml =====
@@ -58,26 +58,28 @@ print(f"n={n}, |E|={len(edges)}")
 # TSQC – Tabu Search for Quasi-Cliques in Rust
 
 ===== src\construct.rs =====
-//! Constructors for an initial vertex subset S₀.
+//! Constructors for an initial subset *S*.
 //!
-//! * `random_k` – choose k distinct vertices uniformly at random.
-//! * `greedy_k` – take the k highest-degree vertices.
-//! * `greedy_random_k` – greedy heuristic with a random start (for TSQC initial solution).
-//! 
-//! All these constructors return a ready-to-use [`Solution`] with edge counts pre-computed.
+//! • `random_k`
+//! • `greedy_k`
+//! • `greedy_random_k`
+//! • `greedy_until_gamma` – grow until density ≥ γ and can’t be enlarged
+//!
+//! All functions return a ready-to-use [`Solution`].
 
 use crate::{graph::Graph, solution::Solution};
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Pick `k` distinct vertices uniformly at random.
-///
-/// `rng` is any mutable RNG; `k` must not exceed `graph.n()`.
+/*───────────────────────────────────────────────────────────*/
+/*  Random-k                                                 */
+/*───────────────────────────────────────────────────────────*/
+
 pub fn random_k<'g, R>(graph: &'g Graph, k: usize, rng: &mut R) -> Solution<'g>
 where
     R: Rng + ?Sized,
 {
-    assert!(k <= graph.n(), "k larger than graph size");
+    assert!(k <= graph.n());
     let mut idx: Vec<usize> = (0..graph.n()).collect();
     idx.shuffle(rng);
 
@@ -88,9 +90,12 @@ where
     sol
 }
 
-/// Greedy initialization: take the `k` highest-degree vertices.
+/*───────────────────────────────────────────────────────────*/
+/*  Greedy-k                                                 */
+/*───────────────────────────────────────────────────────────*/
+
 pub fn greedy_k<'g>(graph: &'g Graph, k: usize) -> Solution<'g> {
-    assert!(k <= graph.n(), "k larger than graph size");
+    assert!(k <= graph.n());
     let mut idx: Vec<usize> = (0..graph.n()).collect();
     idx.sort_unstable_by_key(|&v| std::cmp::Reverse(graph.degree(v)));
 
@@ -101,86 +106,159 @@ pub fn greedy_k<'g>(graph: &'g Graph, k: usize) -> Solution<'g> {
     sol
 }
 
-/// Greedy-random initialization: start with one random vertex, then iteratively add the vertex 
-/// with the most neighbors in the current set (tie-break randomly) until size `k`.
-///
-/// This heuristic injects randomness into the construction of the initial subset S₀, as described 
-/// in TSQC §3.3:contentReference[oaicite:60]{index=60}:contentReference[oaicite:61]{index=61}. It helps generate diverse starting solutions rather 
-/// than always beginning with the same highest-degree vertices.
+/*───────────────────────────────────────────────────────────*/
+/*  Greedy-random-k                                          */
+/*───────────────────────────────────────────────────────────*/
+
 pub fn greedy_random_k<'g, R>(graph: &'g Graph, k: usize, rng: &mut R) -> Solution<'g>
 where
     R: Rng + ?Sized,
 {
-    assert!(k <= graph.n(), "k larger than graph size");
+    assert!(k <= graph.n());
+
     let mut sol = Solution::new(graph);
-    if k == 0 {
-        return sol;
-    }
-    // Step 1: add one random vertex as the starting seed
-    let v0 = rng.gen_range(0..graph.n());
-    sol.add(v0);
-    // Step 2: Iteratively add the vertex with the most neighbors in the current set
-    // Continue until the solution reaches size k.
+    sol.add(rng.gen_range(0..graph.n())); // random seed
+
     while sol.size() < k {
-        let mut best_neighbor_count = 0;
-        let mut best_candidates: Vec<usize> = Vec::new();
-        // Evaluate each outsider vertex by how many connections it has into the current solution
-        for w in 0..graph.n() {
-            if sol.bitset()[w] {
-                continue;
-            }
-            let neighbors_in_sol = graph.neigh_row(w)
+        let mut best_edges = 0usize;
+        let mut cand       = Vec::new();
+
+        for v in 0..graph.n() {
+            if sol.bitset()[v] { continue; }
+            let edges = graph.neigh_row(v)
                 .iter_ones()
                 .filter(|&u| sol.bitset()[u])
                 .count();
-            if neighbors_in_sol > best_neighbor_count {
-                // Found a new outsider with a higher connection count
-                best_neighbor_count = neighbors_in_sol;
-                best_candidates.clear();
-                best_candidates.push(w);
-            } else if neighbors_in_sol == best_neighbor_count {
-                // Tied for highest connections - include in candidates for random tie-break
-                best_candidates.push(w);
+            if edges > best_edges {
+                best_edges = edges;
+                cand.clear();
+                cand.push(v);
+            } else if edges == best_edges {
+                cand.push(v);
             }
         }
-        if best_candidates.is_empty() {
-            break;  // No outsiders (should not happen unless k equals graph.n())
-        }
-        // Choose one of the top candidates at random to introduce some randomness
-        best_candidates.shuffle(rng);
-        let w = best_candidates[0];
-        sol.add(w);
+        sol.add(*cand.choose(rng).unwrap());
     }
-    return sol;
+    sol
 }
+
+/*───────────────────────────────────────────────────────────*/
+/*  Greedy until γ-density cannot grow further               */
+/*───────────────────────────────────────────────────────────*/
+
+/// Grow *S* while density remains ≥ `gamma`.  
+/// Uses the **internal-neighbour** count (as in the thesis) and random
+/// tie-breaking every iteration.  Stops when inserting any outsider
+/// would drop the density below `gamma`.
+pub fn greedy_until_gamma<'g, R>(
+    graph: &'g Graph,
+    gamma: f64,
+    rng: &mut R,
+) -> Solution<'g>
+where
+    R: Rng + ?Sized,
+{
+    assert!((0.0..=1.0).contains(&gamma));
+
+    /*── start with a random edge (or two random vertices) ──────────*/
+    let mut sol = Solution::new(graph);
+    let mut verts: Vec<usize> = (0..graph.n()).collect();
+    verts.shuffle(rng);
+
+    let mut edge_found = false;
+    'edge: for &u in &verts {
+        for &v in &verts {
+            if u < v && graph.neigh_row(u)[v] {
+                sol.add(u);
+                sol.add(v);
+                edge_found = true;
+                break 'edge;
+            }
+        }
+    }
+    if !edge_found {
+        sol.add(verts[0]);
+        sol.add(verts[1]);
+    }
+
+    /*── greedy expansion with shuffle each round ───────────────────*/
+    loop {
+        let mut outsiders: Vec<usize> =
+            (0..graph.n()).filter(|&v| !sol.bitset()[v]).collect();
+        if outsiders.is_empty() { break; }
+
+        outsiders.shuffle(rng);   // random tie-break every iteration
+
+        // compute max neighbour count inside S
+        let mut best_edges = 0usize;
+        for &v in &outsiders {
+            let e = graph.neigh_row(v)
+                .iter_ones()
+                .filter(|&u| sol.bitset()[u])
+                .count();
+            best_edges = best_edges.max(e);
+        }
+
+        // collect all outsiders achieving that max
+        let mut cand: Vec<usize> = outsiders.into_iter()
+            .filter(|&v| {
+                graph.neigh_row(v)
+                    .iter_ones()
+                    .filter(|&u| sol.bitset()[u])
+                    .count() == best_edges
+            })
+            .collect();
+        if cand.is_empty() { break; }
+
+        let v = *cand.choose(rng).unwrap();
+        sol.add(v);
+        if sol.density() + f64::EPSILON < gamma {
+            sol.remove(v);
+            break;          // no further vertex can be inserted
+        }
+    }
+
+    /*── last-chance scan: try any remaining outsiders once ─────────*/
+    let mut outsiders: Vec<usize> =
+        (0..graph.n()).filter(|&v| !sol.bitset()[v]).collect();
+    outsiders.shuffle(rng);
+    for v in outsiders {
+        sol.add(v);
+        if sol.density() + f64::EPSILON < gamma {
+            sol.remove(v);
+        }
+    }
+
+    sol
+}
+
+/*──────────────────────── tests ───────────────────────────*/
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use rand_chacha::ChaCha8Rng;
     use rand::SeedableRng;
+    use std::io::Cursor;
 
     fn triangle() -> Graph {
-        // Simple 3-vertex triangle graph
-        let dimacs = b"p edge 3 3\n\
-                       e 1 2\n\
-                       e 1 3\n\
-                       e 2 3\n";
+        let dimacs = b"p edge 3 3\ne 1 2\ne 1 3\ne 2 3\n";
         Graph::parse_dimacs(Cursor::new(dimacs)).unwrap()
     }
 
     #[test]
-    fn random_vs_greedy() {
+    fn until_gamma_maximal() {
         let g = triangle();
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let r = random_k(&g, 2, &mut rng);
-        assert_eq!(r.size(), 2);
-        let g2 = greedy_k(&g, 2);
-        assert_eq!(g2.size(), 2);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let sol = greedy_until_gamma(&g, 0.8, &mut rng);
+        assert!(sol.density() >= 0.8);
+        for v in 0..g.n() {
+            if sol.bitset()[v] { continue; }
+            let mut tmp = sol.clone();
+            tmp.add(v);
+            assert!(tmp.density() < 0.8);
+        }
     }
-
-    // (No direct test for greedy_random_k here, but its behavior can be inferred from its construction.)
 }
 
 ===== src\diversify.rs =====
@@ -617,53 +695,87 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 ===== src\maxk.rs =====
-//! Outer “max-k” search: find the largest γ-quasi-clique by
-//! solving a series of fixed-k problems for increasing `k`.
+//! Outer **max-k** search for TSQC (Algorithm 1).
 //!
-//! *Stop-criterium volgens paper*: zodra twee opeenvolgende k-waarden
-//! geen γ-feasible oplossing opleveren, gaan we ervan uit dat geen
-//! groter γ-quasi-clique bestaat en stoppen we.
+//! 1.  Build a greedy γ-feasible subset S₀  →  *k_lb* = |S₀|  
+//! 2.  For k = k_lb, k_lb+1, …  
+//!       • Skip k if a degree upper-bound proves impossibility.  
+//!       • Otherwise call `solve_fixed_k` (tabu search).  
+//!       • If k > best_size **and** infeasible  →  stop (first failure above best).  
+//! 3.  Return the largest γ-quasi-clique found.
 
-use crate::{params::Params, restart::solve_fixed_k, solution::Solution, Graph};
+use crate::{
+    construct::greedy_until_gamma,
+    params::Params,
+    restart::solve_fixed_k,
+    solution::Solution,
+    Graph,
+};
 use rand::Rng;
 
-/// Solve the MQCP for a given graph and parameters.
-/// Returns the largest γ-quasi-clique (best size, densest among ties).
-pub fn solve_maxk<'g, R>(
-    graph: &'g Graph,
-    rng: &mut R,
-    p: &Params,
-) -> Solution<'g>
+/*───────────────────────────────────────────────────────────*/
+/*  Degree upper-bound UB(k) = ½ Σ₀^{k-1} min{dᵢ, k-1}        */
+/*───────────────────────────────────────────────────────────*/
+
+fn degree_prefix(graph: &Graph) -> Vec<usize> {
+    let mut deg: Vec<usize> = (0..graph.n()).map(|v| graph.degree(v)).collect();
+    deg.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    let mut pref = Vec::with_capacity(deg.len() + 1);
+    pref.push(0);
+    let mut s = 0usize;
+    for d in deg {
+        s += d;
+        pref.push(s);
+    }
+    pref // pref[i] = Σ d₀..d_{i-1}
+}
+
+#[inline]
+fn ub_edges(prefix: &[usize], k: usize) -> usize {
+    let mut s = 0usize;
+    for i in 0..k {
+        let d_i = prefix[i + 1] - prefix[i];
+        s += d_i.min(k - 1);
+    }
+    s / 2
+}
+
+/*───────────────────────────────────────────────────────────*/
+/*  Public driver                                            */
+/*───────────────────────────────────────────────────────────*/
+
+pub fn solve_maxk<'g, R>(graph: &'g Graph, rng: &mut R, p: &Params) -> Solution<'g>
 where
     R: Rng + ?Sized,
 {
-    // best solution seen so far
-    let mut best_sol = Solution::new(graph); // empty
-    let mut best_d   = 0.0;
+    /* 1 ─ greedy γ-feasible lower bound */
+    let mut best_sol = greedy_until_gamma(graph, p.gamma_target, rng);
+    let k_lb         = best_sol.size();
 
-    // stop when we fail for two consecutive k
-    let mut consecutive_fail = 0usize;
+    /* 2 ─ degree upper-bound table */
+    let pref = degree_prefix(graph);
 
-    // iterate k from 2 up to n
-    for k in 2..=graph.n() {
+    for k in k_lb..=graph.n() {
+        eprintln!("k = {}", k);
+        if k == best_sol.size() {
+            continue; // already feasible at this size
+        }
+
+        // quick impossibility check
+        let required = ((p.gamma_target * (k * (k - 1) / 2) as f64).ceil()) as usize;
+        if ub_edges(&pref, k) < required {
+            if k > best_sol.size() {
+                break; // first failure above best size  → stop
+            }
+            continue;
+        }
+
+        // expensive tabu search
         let sol_k = solve_fixed_k(graph, k, rng, p);
-        let d     = sol_k.density();
-
-        if d + f64::EPSILON >= p.gamma_target {
-            // found γ-feasible => reset fail counter
-            consecutive_fail = 0;
-
-            // update global best
-            if k > best_sol.size() || (k == best_sol.size() && d > best_d) {
-                best_d   = d;
-                best_sol = sol_k;
-            }
-        } else {
-            // this k failed
-            consecutive_fail += 1;
-            if consecutive_fail >= 2 {
-                break; // paper stop-rule
-            }
+        if sol_k.density() + f64::EPSILON >= p.gamma_target {
+            best_sol = sol_k; // update best
+        } else if k > best_sol.size() {
+            break; // first infeasible k above best size
         }
     }
 
@@ -818,32 +930,24 @@ where
 // as we now handle the intensification loop explicitly in solve_fixed_k for better control.)
 
 ===== src\params.rs =====
-//! Parameter bundle for TSQC (Tabu Search for γ-quasi-cliques).
-//!
-//! These tunable parameters control the tabu search behavior, diversification intensity, and restart criteria.
-//! 
-//! - `tenure_u` and `tenure_v` are the initial tabu tenures for removed and added vertices (adaptive updates will override them during search).
-//! - `gamma` controls the strength of heavy perturbation in the original design (fraction of the solution to replace). In our adapted implementation, heavy moves always remove 1 vertex (this parameter is unused by the current heavy perturbation logic).
-//! - `gamma_target` is the density threshold (γ) that defines a quasi-clique (feasibility target).
-//! - `stagnation_iter` is the number of consecutive non-improving iterations to tolerate before considering the search "stagnant". (In our implementation, we diversify immediately upon stagnation, so this effectively serves as an upper bound and as a safe value for frequency reset threshold).
-//! - `max_iter` is the global cap on the total number of iterations (across all restarts and moves).
+//! Parameter bundle for TSQC (adaptive multistart tabu search).
 
 #[derive(Clone, Debug)]
 pub struct Params {
-    /* ─── Tabu tenure base (will be adapted dynamically) ─── */
+    /*── Tabu tenure base (adapted during search) ──*/
     pub tenure_u: usize,
     pub tenure_v: usize,
 
-    /* ─── Diversification ─── */
-    pub gamma:        f64,   // (Unused in new heavy_perturbation) fraction of |S| to remove in original heavy perturbation
-    pub heavy_prob:   f64,   // probability of choosing heavy vs. mild diversification
+    /*── Diversification ──*/
+    pub gamma:        f64,   // (unused by current heavy move)
+    pub heavy_prob:   f64,   // probability of heavy perturbation
 
-    /* ─── Quasi-clique feasibility goal ─── */
-    pub gamma_target: f64,   // target density γ for a quasi-clique
+    /*── Quasi-clique feasibility goal ──*/
+    pub gamma_target: f64,   // user-supplied γ
 
-    /* ─── Restart / search limits ─── */
-    pub stagnation_iter: usize, // stagnation threshold (L in the paper – max consecutive iterations with no improvement)
-    pub max_iter:        usize, // hard cap on total iterations (It_max)
+    /*── Stagnation & iteration limits ──*/
+    pub stagnation_iter: usize, // iterations with no improvement before diversifying
+    pub max_iter:        usize, // global hard cap
 }
 
 impl Default for Params {
@@ -851,28 +955,36 @@ impl Default for Params {
         Self {
             tenure_u: 7,
             tenure_v: 7,
-            // A small heavy perturbation probability by default, as TSQC applies heavy moves rarely
-            gamma:      0.50,
-            heavy_prob: 0.10,
-            /* The default gamma_target of 0.90 matches the “sparse quasi-clique” benchmark in the thesis. 
-               It can be adjusted by the caller if a different density threshold is needed. */
+
+            gamma:        0.50,      // fraction removed in original heavy move
+            heavy_prob:   0.40,      // thesis value for γ ≤ 0.9
+
             gamma_target: 0.90,
-            stagnation_iter: 1_000,
-            max_iter:        1_000_000,
+
+            stagnation_iter: 1000,          // thesis uses 200
+            max_iter:        100_000,    // thesis It_max
         }
     }
 }
 
 ===== src\restart.rs =====
-//! Multi-start controller: initial construction → local search → diversification → possible restart.
+//! Multi-start controller: constructive initial | local search |
+//! diversification | possible restart (Algorithm 2 in the thesis).
 //!
-//! The `solve_fixed_k` function runs the TSQC search for a fixed subset size `k`. If no γ-feasible
-//! solution is found in one run of tabu search, it **restarts** with a new initial solution generated
-//! from long-term frequency memory. This continues until a quasi-clique is found or the global
-//! iteration limit is reached, following Algorithm 2 in the thesis.
+//! •  Each run executes tabu search for a fixed `k` until it
+//!    • finds a γ-feasible subset, or
+//!    • hits stagnation and fails the clique upper-bound test
+//!      (paper rule U1 → infeasible).
+//! •  If γ-feasible: return immediately.
+//! •  If infeasible: create a new initial subset biased by
+//!    long-term frequency memory and restart, unless `max_iter` is
+//!    exhausted.
+//!
+//! The outer *max-k* driver (`maxk.rs`) calls this routine once per
+//! value of `k`.
 
 use crate::{
-    construct::greedy_random_k,
+    construct::{greedy_random_k},
     diversify::{heavy_perturbation, mild_perturbation},
     neighbour::improve_once,
     params::Params,
@@ -883,8 +995,10 @@ use crate::{
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Tabu search for a fixed subset size `k`.  
-/// Returns the best solution found (γ-feasible or densest illegal subset).
+/*───────────────────────────────────────────────────────────*/
+/*  Fixed-k multi-start search                               */
+/*───────────────────────────────────────────────────────────*/
+
 pub fn solve_fixed_k<'g, R>(
     graph: &'g Graph,
     k: usize,
@@ -894,163 +1008,143 @@ pub fn solve_fixed_k<'g, R>(
 where
     R: Rng + ?Sized,
 {
-    /*────────────────── long-term frequency memory ──────────────────*/
-    let mut freq: Vec<usize> = vec![0; graph.n()];
-
-    /*────────────────── initial solution (greedy-random) ────────────*/
-    let mut best_solution = greedy_random_k(graph, k, rng);
-    let mut best_density = best_solution.density();
-
-    /*──────── global best across restarts ────────*/
-    let mut global_best = best_solution.clone();
-    let mut global_best_d = best_density;
-
-    if best_density + f64::EPSILON >= p.gamma_target {
-        return best_solution;
+    /*── quick impossibility check before any effort ─────────────*/
+    let req_edges =
+        ((p.gamma_target * (k * (k - 1) / 2) as f64).ceil()) as usize;
+    if (k * (k - 1) / 2) < req_edges {
+        return Solution::new(graph); // nothing possible at this k
     }
 
-    /*──────── counters ────────*/
-    let mut total_it = 0usize;
+    /*── long-term frequency memory (used across restarts) ───────*/
+    let mut freq: Vec<usize> = vec![0; graph.n()];
 
-    /*================================================================
-     * Restart loop
-     *================================================================*/
+    /*── counters ────────────────────────────────────────────────*/
+    let mut total_iter = 0usize;
+    let mut attempt    = 1usize;
+
+    /*── best over all restarts (for return if infeasible) ───────*/
+    let mut global_best_sol = Solution::new(graph);
+    let mut global_best_d   = 0.0;
+
+    /*──────────────── outer restart loop ────────────────────────*/
     loop {
-        /*── tabu list for this run ─*/
+        /*── initial subset: greedy-random, then bias vs frequency */
+        let mut current =
+            if attempt == 1 {
+                // first attempt: plain greedy-random
+                greedy_random_k(graph, k, rng)
+            } else {
+                // subsequent attempts: start from least-used vertex
+                let min_f = *freq.iter().min().unwrap();
+                let mut cand: Vec<usize> =
+                    (0..graph.n()).filter(|&v| freq[v] == min_f).collect();
+                cand.shuffle(rng);
+                let seed = cand[0];
+
+                let mut s = Solution::new(graph);
+                s.add(seed);
+                while s.size() < k {
+                    // outsider with max internal degree, break ties by low freq
+                    let mut best_edges = 0usize;
+                    let mut best_v     = Vec::new();
+                    for v in 0..graph.n() {
+                        if s.bitset()[v] { continue; }
+                        let edges = graph.neigh_row(v)
+                            .iter_ones()
+                            .filter(|&u| s.bitset()[u])
+                            .count();
+                        if edges > best_edges {
+                            best_edges = edges;
+                            best_v.clear();
+                            best_v.push(v);
+                        } else if edges == best_edges {
+                            best_v.push(v);
+                        }
+                    }
+                    best_v.shuffle(rng);
+                    s.add(best_v[0]);
+                }
+                s
+            };
+
+        /*── tabu structures for this run ───────────────────────*/
         let mut tabu = DualTabu::new(graph.n(), p.tenure_u, p.tenure_v);
-        tabu.update_tenures(
-            best_solution.size(),
-            best_solution.edges(),
-            p.gamma_target,
-            rng,
-        );
+        tabu.update_tenures(k, current.edges(), p.gamma_target, rng);
 
-        /*── current solution state ─*/
-        let mut cur = best_solution.clone();
-        let mut run_best = cur.clone();
-        let mut run_best_d = cur.density();
-        let mut stagn = 0usize;
+        let mut best_sol = current.clone();
+        let mut best_d   = current.density();
+        let mut no_improve = 0usize;
 
-        /*============================================================
-         * Inner loop – intensification & diversification
-         *===========================================================*/
+        /* upper-bound helper (paper rule U1) */
+        let infeasible = |edges: usize| -> bool {
+            let ub = k * (k - 1) / 2; // edges in a clique
+            ub < req_edges || edges >= ub
+        };
+
+        /*── inner tabu search loop ─────────────────────────────*/
         loop {
-            /* Intensification: one swap */
-            if improve_once(
-                &mut cur,
+            let improved = improve_once(
+                &mut current,
                 &mut tabu,
-                run_best_d,
+                best_d,
                 &mut freq,
                 p,
                 rng,
-            ) {
-                total_it += 1;
-                let d = cur.density();
-                if d > run_best_d {
-                    run_best_d = d;
-                    run_best = cur.clone();
-                    stagn = 0;
-                } else {
-                    stagn += 1;
-                }
+            );
+            total_iter += 1;
 
-                /* feasible? */
-                if d + f64::EPSILON >= p.gamma_target {
-                    return cur;
-                }
-                if total_it >= p.max_iter {
-                    return global_best;
-                }
-                if stagn < p.stagnation_iter {
-                    continue;
+            if improved {
+                let d = current.density();
+                if d > best_d {
+                    best_d     = d;
+                    best_sol   = current.clone();
+                    no_improve = 0;
+                } else {
+                    no_improve += 1;
                 }
             } else {
-                stagn += 1; // no allowable swap (local optimum)
+                no_improve += 1;
             }
 
-            /* Diversification on stagnation */
-            if stagn >= p.stagnation_iter {
+            /* success ── found γ-feasible subset */
+            if best_d + f64::EPSILON >= p.gamma_target {
+                return best_sol;
+            }
+
+            /* stagnation ⇒ diversification */
+            if no_improve >= p.stagnation_iter {
                 if rng.gen_bool(p.heavy_prob) {
-                    heavy_perturbation(&mut cur, &mut tabu, rng, p, &mut freq);
+                    heavy_perturbation(&mut current, &mut tabu, rng, p, &mut freq);
                 } else {
-                    mild_perturbation(&mut cur, &mut tabu, rng, p, &mut freq); // <-- p toegevoegd
+                    mild_perturbation (&mut current, &mut tabu, rng, p, &mut freq);
                 }
-                stagn = 0;
-                total_it += 1;
-                if total_it >= p.max_iter {
-                    return global_best;
+                no_improve = 0;
+
+                /* upper-bound abort right after diversification */
+                if infeasible(best_sol.edges()) {
+                    break; // infeasible run – restart
                 }
-                continue; // back to intensification
             }
-            break; // inner loop finished without diversification
+
+            /* global iteration cap */
+            if total_iter >= p.max_iter {
+                return global_best_sol;
+            }
         }
 
-        /*── update global best ─*/
-        if run_best_d > global_best_d {
-            global_best_d = run_best_d;
-            global_best = run_best.clone();
-        }
-        if total_it >= p.max_iter {
-            break;
+        /*── run ended infeasible – update global best & restart ──*/
+        if best_d > global_best_d {
+            global_best_d   = best_d;
+            global_best_sol = best_sol.clone();
         }
 
-        /*================================================================
-         * Build new initial solution using long-term frequency memory
-         *================================================================*/
-        // a) start vertex = least-frequent
-        let min_f = *freq.iter().min().unwrap();
-        let mut cand: Vec<usize> = (0..graph.n()).filter(|&v| freq[v] == min_f).collect();
-        cand.shuffle(rng);
-        let first = cand[0];
-
-        let mut new_sol = Solution::new(graph);
-        new_sol.add(first);
-
-        // b) greedily add vertices (highest degree, low freq)
-        while new_sol.size() < k {
-            let mut max_deg = 0usize;
-            for w in 0..graph.n() {
-                if new_sol.bitset()[w] {
-                    continue;
-                }
-                max_deg = max_deg.max(graph.degree(w));
-            }
-            let mut best_deg_verts = Vec::new();
-            for w in 0..graph.n() {
-                if new_sol.bitset()[w] || graph.degree(w) < max_deg {
-                    continue;
-                }
-                best_deg_verts.push(w);
-            }
-            if best_deg_verts.is_empty() {
-                break;
-            }
-            // prefer vertices with minimal frequency among the top-degree set
-            let min_f2 = best_deg_verts.iter().map(|&v| freq[v]).min().unwrap();
-            let mut best_choices: Vec<usize> =
-                best_deg_verts.into_iter().filter(|&v| freq[v] == min_f2).collect();
-            best_choices.shuffle(rng);
-            new_sol.add(best_choices[0]);
-        }
-
-        // c) update frequencies
-        for v in new_sol.bitset().iter_ones() {
+        /*── update long-term frequencies for restart bias ──────*/
+        for v in current.bitset().iter_ones() {
             freq[v] += 1;
-            if freq[v] > k {
-                freq.fill(0);
-            }
         }
 
-        /*── prepare next run ─*/
-        best_solution = new_sol;
-        best_density = best_solution.density();
-        if best_density + f64::EPSILON >= p.gamma_target {
-            return best_solution;
-        }
+        attempt += 1;
     }
-
-    /* max_iter reached */
-    global_best
 }
 
 ===== src\solution.rs =====

@@ -1,9 +1,9 @@
-//! Multi-start controller: initial construction → local search → diversification → possible restart.
+//! Multi-start controller for one fixed k  (Algorithm 2).
 //!
-//! The `solve_fixed_k` function runs the TSQC search for a fixed subset size `k`. If no γ-feasible
-//! solution is found in one run of tabu search, it **restarts** with a new initial solution generated
-//! from long-term frequency memory. This continues until a quasi-clique is found or the global
-//! iteration limit is reached, following Algorithm 2 in the thesis.
+//! • Runs tabu-search until it finds a γ-feasible subset *or*
+//!   the clique upper-bound (rule U1) proves infeasibility.
+//! • If infeasible → build a new initial subset biased by the
+//!   long-term frequencies and restart, until `max_iter`.
 
 use crate::{
     construct::greedy_random_k,
@@ -17,8 +17,9 @@ use crate::{
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Tabu search for a fixed subset size `k`.  
-/// Returns the best solution found (γ-feasible or densest illegal subset).
+/* ────────────────────────────────────────────────────────── */
+
+/// return the best solution found for this `k`
 pub fn solve_fixed_k<'g, R>(
     graph: &'g Graph,
     k: usize,
@@ -28,161 +29,129 @@ pub fn solve_fixed_k<'g, R>(
 where
     R: Rng + ?Sized,
 {
-    /*────────────────── long-term frequency memory ──────────────────*/
-    let mut freq: Vec<usize> = vec![0; graph.n()];
-
-    /*────────────────── initial solution (greedy-random) ────────────*/
-    let mut best_solution = greedy_random_k(graph, k, rng);
-    let mut best_density = best_solution.density();
-
-    /*──────── global best across restarts ────────*/
-    let mut global_best = best_solution.clone();
-    let mut global_best_d = best_density;
-
-    if best_density + f64::EPSILON >= p.gamma_target {
-        return best_solution;
+    /* quick impossibility check */
+    let req = ((p.gamma_target * (k * (k - 1) / 2) as f64).ceil()) as usize;
+    if (k * (k - 1) / 2) < req {
+        return Solution::new(graph);                     // impossible size
     }
 
-    /*──────── counters ────────*/
+    /* long-term frequency memory */
+    let mut freq: Vec<usize> = vec![0; graph.n()];
+
+    /* global best (may be infeasible) */
+    let mut best_overall = Solution::new(graph);
+    let mut best_rho     = 0.0;
+
     let mut total_it = 0usize;
+    let     mut run  = 0usize;
 
-    /*================================================================
-     * Restart loop
-     *================================================================*/
-    loop {
-        /*── tabu list for this run ─*/
+    /* helper: clique upper-bound rule U1 for *current* solution */
+    let mut infeasible = |edges_cur: usize| -> bool {
+        let ub = k * (k - 1) / 2;      // clique
+        ub < req || edges_cur >= ub    // second term can only happen if
+    };                                 // we already have a clique
+
+    /* ========================================================= */
+    'restart: loop {
+        run += 1;
+
+        /* ---- 1  initial subset -------------------------------- */
+        let mut cur = if run == 1 {
+            greedy_random_k(graph, k, rng)
+        } else {
+            /* biased by long-term frequency (least-used vertex seed) */
+            let min_f = *freq.iter().min().unwrap();
+            let mut cand: Vec<_> = (0..graph.n()).filter(|&v| freq[v] == min_f).collect();
+            cand.shuffle(rng);
+            let seed = cand[0];
+
+            let mut s = Solution::new(graph);
+            s.add(seed);
+            while s.size() < k {
+                let mut best_deg = 0usize;
+                let mut pool     = Vec::new();
+                for v in 0..graph.n() {
+                    if s.bitset()[v] { continue; }
+                    let d = graph.neigh_row(v)
+                                  .iter_ones()
+                                  .filter(|&u| s.bitset()[u])
+                                  .count();
+                    match d.cmp(&best_deg) {
+                        std::cmp::Ordering::Greater => { best_deg = d; pool.clear(); pool.push(v); }
+                        std::cmp::Ordering::Equal   => pool.push(v),
+                        _ => {}
+                    }
+                }
+                s.add(*pool.choose(rng).unwrap());
+            }
+            s
+        };
+
+        /* tabu structures */
         let mut tabu = DualTabu::new(graph.n(), p.tenure_u, p.tenure_v);
-        tabu.update_tenures(
-            best_solution.size(),
-            best_solution.edges(),
-            p.gamma_target,
-            rng,
-        );
+        tabu.update_tenures(k, cur.edges(), p.gamma_target, rng);
 
-        /*── current solution state ─*/
-        let mut cur = best_solution.clone();
-        let mut run_best = cur.clone();
-        let mut run_best_d = cur.density();
+        let mut best_run = cur.clone();
+        let mut best_rho_run = cur.density();
+
         let mut stagn = 0usize;
 
-        /*============================================================
-         * Inner loop – intensification & diversification
-         *===========================================================*/
+        /* ---- 2  inner loop ----------------------------------- */
         loop {
-            /* Intensification: one swap */
-            if improve_once(
-                &mut cur,
-                &mut tabu,
-                run_best_d,
-                &mut freq,
-                p,
-                rng,
-            ) {
-                total_it += 1;
-                let d = cur.density();
-                if d > run_best_d {
-                    run_best_d = d;
-                    run_best = cur.clone();
-                    stagn = 0;
+            let moved = improve_once(&mut cur, &mut tabu,
+                                     best_rho_run, &mut freq, p, rng);
+            total_it += 1;
+
+            if moved {
+                let rho = cur.density();
+                if rho > best_rho_run {
+                    best_rho_run = rho;
+                    best_run     = cur.clone();
+                    stagn        = 0;
                 } else {
                     stagn += 1;
                 }
-
-                /* feasible? */
-                if d + f64::EPSILON >= p.gamma_target {
-                    return cur;
-                }
-                if total_it >= p.max_iter {
-                    return global_best;
-                }
-                if stagn < p.stagnation_iter {
-                    continue;
-                }
             } else {
-                stagn += 1; // no allowable swap (local optimum)
+                stagn += 1;
             }
 
-            /* Diversification on stagnation */
+            /* γ-feasible → done */
+            if best_rho_run + f64::EPSILON >= p.gamma_target {
+                return best_run;
+            }
+
+            /* diversification after L iterations with no gain */
             if stagn >= p.stagnation_iter {
                 if rng.gen_bool(p.heavy_prob) {
                     heavy_perturbation(&mut cur, &mut tabu, rng, p, &mut freq);
                 } else {
-                    mild_perturbation(&mut cur, &mut tabu, rng, p, &mut freq); // <-- p toegevoegd
+                    mild_perturbation (&mut cur, &mut tabu, rng, p, &mut freq);
                 }
                 stagn = 0;
-                total_it += 1;
-                if total_it >= p.max_iter {
-                    return global_best;
+
+                /* immediately test rule U1 on the *current* solution */
+                if infeasible(cur.edges()) {
+                    break;              // abort this run, restart
                 }
-                continue; // back to intensification
             }
-            break; // inner loop finished without diversification
+
+            /* also abort if *no* admissible swap was possible */
+            if !moved && infeasible(cur.edges()) {
+                break;                  // restart
+            }
+
+            if total_it >= p.max_iter {
+                return best_overall;    // hard cap
+            }
         }
 
-        /*── update global best ─*/
-        if run_best_d > global_best_d {
-            global_best_d = run_best_d;
-            global_best = run_best.clone();
+        /* ---- 3  update long-term memory & restart ------------- */
+        if best_rho_run > best_rho {
+            best_rho     = best_rho_run;
+            best_overall = best_run.clone();
         }
-        if total_it >= p.max_iter {
-            break;
-        }
-
-        /*================================================================
-         * Build new initial solution using long-term frequency memory
-         *================================================================*/
-        // a) start vertex = least-frequent
-        let min_f = *freq.iter().min().unwrap();
-        let mut cand: Vec<usize> = (0..graph.n()).filter(|&v| freq[v] == min_f).collect();
-        cand.shuffle(rng);
-        let first = cand[0];
-
-        let mut new_sol = Solution::new(graph);
-        new_sol.add(first);
-
-        // b) greedily add vertices (highest degree, low freq)
-        while new_sol.size() < k {
-            let mut max_deg = 0usize;
-            for w in 0..graph.n() {
-                if new_sol.bitset()[w] {
-                    continue;
-                }
-                max_deg = max_deg.max(graph.degree(w));
-            }
-            let mut best_deg_verts = Vec::new();
-            for w in 0..graph.n() {
-                if new_sol.bitset()[w] || graph.degree(w) < max_deg {
-                    continue;
-                }
-                best_deg_verts.push(w);
-            }
-            if best_deg_verts.is_empty() {
-                break;
-            }
-            // prefer vertices with minimal frequency among the top-degree set
-            let min_f2 = best_deg_verts.iter().map(|&v| freq[v]).min().unwrap();
-            let mut best_choices: Vec<usize> =
-                best_deg_verts.into_iter().filter(|&v| freq[v] == min_f2).collect();
-            best_choices.shuffle(rng);
-            new_sol.add(best_choices[0]);
-        }
-
-        // c) update frequencies
-        for v in new_sol.bitset().iter_ones() {
+        for v in best_run.bitset().iter_ones() {
             freq[v] += 1;
-            if freq[v] > k {
-                freq.fill(0);
-            }
-        }
-
-        /*── prepare next run ─*/
-        best_solution = new_sol;
-        best_density = best_solution.density();
-        if best_density + f64::EPSILON >= p.gamma_target {
-            return best_solution;
         }
     }
-
-    /* max_iter reached */
-    global_best
 }
