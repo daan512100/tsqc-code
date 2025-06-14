@@ -1,213 +1,203 @@
-//! Diversification operators for TSQC (applied when the search is stuck in a local optimum).
+// src/diversify.rs
+//! Adaptive diversification (heavy vs. mild perturbations) for TSQC (§ 3.4.2).
 //!
-//! Heavy perturbation introduces a large disruption: it swaps out one vertex from the solution
-//! for a very low-degree vertex not in the solution, producing a worse (lower-density) interim
-//! solution to escape a local optimum. Mild perturbation is a smaller change: it swaps out a
-//! “critical” vertex (one of the least connected in S) for a well-connected outsider, often
-//! yielding only a slight decrease in density.  Both moves reset the tabu lists, and the search
-//! then continues from the perturbed solution.
+//! ▲ heavy_perturbation: “large shake”
+//! ▲ mild_perturbation: “small shake”
+//!
+//! After each perturbation we:
+//!  1. Increment long‐term frequency memory for swapped vertices.
+//!  2. Reset the tabu lists.
+//!  3. Recompute tabu tenures based on the new solution.
 
-use crate::{solution::Solution, tabu::DualTabu, params::Params};
+use crate::{params::Params, solution::Solution, tabu::DualTabu, Graph};
 use rand::seq::SliceRandom;
 use rand::Rng;
+use std::f64;
 
-/*───────────────────────────────────────────────────────────────────*/
-/*  Heavy perturbation                                               */
-/*───────────────────────────────────────────────────────────────────*/
-
-/// Heavy perturbation: remove one random vertex from S, then add an outsider with very few
-/// connections to S.
-///
-/// A “low-degree” outside vertex is chosen (degree < *h* in the current S) such that the new
-/// solution is worse (density decreases), helping the search jump to a new region.  The tabu
-/// lists are **reset** after this move, clearing any short-term memory.  The parameter `p` is
-/// used for `gamma_target` (quasi-clique density) in adaptive tenure updates.
+/// Heavy perturbation (“large shake”):
+/// 1. Remove a random vertex `u` ∈ S.
+/// 2. Compute threshold `h = ⌈k^0.85⌉ if graph density ≥ 0.5 else ⌈k^0.5⌉`.
+/// 3. Collect outsiders `v ∉ S` with `deg_in(v) < h`; if none, take those with minimal `deg_in`.
+/// 4. Add one randomly chosen `v`.
+/// 5. Increment `freq[u]` and `freq[v]`; if any `> k`, reset all to 0.
+/// 6. Clear tabu lists and then update tenures.
 pub fn heavy_perturbation<'g, R>(
     sol: &mut Solution<'g>,
     tabu: &mut DualTabu,
     rng: &mut R,
     p: &Params,
-    freq: &mut [usize],
+    freq: &mut Vec<usize>,
 ) where
     R: Rng + ?Sized,
 {
-    /* Guard */
     let k = sol.size();
-    if k == 0 {
+    if k < 1 {
         return;
     }
 
-    /* 1 ─ randomly remove one vertex from S */
-    let mut inside: Vec<usize> = sol.bitset().iter_ones().collect();
-    inside.shuffle(rng);
-    let u = inside[0];
+    // 1) pick and remove random u ∈ S
+    let u = *sol
+        .bitset()
+        .iter_ones()
+        .collect::<Vec<_>>()
+        .choose(rng)
+        .expect("Solution must be non-empty");
     sol.remove(u);
 
-    /* 2 ─ determine threshold h for “low-degree” outsider.
-     *     Heuristic: if the graph is very sparse, sqrt(k) may be too strict – use k^0.85. */
+    // 2) threshold h, density‐based
     let n = sol.graph().n();
-    let graph_density = if n < 2 {
-        0.0
+    let m = sol.graph().m();
+    let dn = 2.0 * (m as f64) / ((n * (n - 1) / 2) as f64);
+    let h = if dn >= 0.5 {
+        (k as f64).powf(0.85).ceil() as usize
     } else {
-        2.0 * (sol.graph().m() as f64) / ((n * (n - 1)) as f64)
-    };
-    let mut h: f64 = if graph_density * (k as f64) <= 1.0 {
-        // extremely sparse –- relax threshold
-        (k as f64).powf(0.85)
-    } else {
-        (k as f64).sqrt()
-    };
-    h = h.clamp(1.0, k as f64 - 1.0).ceil();          // ensure 1 ≤ h ≤ k-1
-    let h_thresh = h as usize;
-
-    /* 3 ─ pick outsider with < h edges into current S */
-    let mut outsiders: Vec<usize> =
-        (0..sol.graph().n()).filter(|&v| !sol.bitset()[v]).collect();
-    outsiders.shuffle(rng);
-
-    let mut v_opt = None;
-    for &w in &outsiders {
-        let deg_in = sol
-            .graph()
-            .neigh_row(w)
-            .iter_ones()
-            .filter(|&j| sol.bitset()[j])
-            .count();
-        if deg_in < h_thresh {
-            v_opt = Some(w);
-            break;
-        }
+        (k as f64).sqrt().ceil() as usize
     }
-    let v = v_opt.unwrap_or_else(|| {
-        // no outsider below threshold – take one with minimal degree into S
-        outsiders
+    .clamp(1, k.saturating_sub(1));
+
+    // 3) collect outsiders
+    let outsiders: Vec<usize> = (0..n).filter(|&v| !sol.bitset()[v]).collect();
+
+    let mut candidates: Vec<usize> = outsiders
+        .iter()
+        .copied()
+        .filter(|&v| {
+            sol.graph()
+                .neigh_row(v)
+                .iter_ones()
+                .filter(|&j| sol.bitset()[j])
+                .count()
+                < h
+        })
+        .collect();
+
+    // fallback to minimal deg_in if none < h
+    if candidates.is_empty() {
+        let min_deg = outsiders
             .iter()
-            .copied()
-            .min_by_key(|&w| {
+            .map(|&v| {
                 sol.graph()
-                    .neigh_row(w)
+                    .neigh_row(v)
                     .iter_ones()
                     .filter(|&j| sol.bitset()[j])
                     .count()
             })
-            .unwrap()
-    });
-    sol.add(v);
-
-    /* 4 ─ update long-term frequencies */
-    for &vx in &[u, v] {
-        freq[vx] += 1;
-        if freq[vx] > k {
-            freq.fill(0);
-        }
+            .min()
+            .unwrap_or(0);
+        candidates = outsiders
+            .into_iter()
+            .filter(|&v| {
+                sol.graph()
+                    .neigh_row(v)
+                    .iter_ones()
+                    .filter(|&j| sol.bitset()[j])
+                    .count()
+                    == min_deg
+            })
+            .collect();
     }
 
-    /* 5 ─ adapt tabu tenures to new (worse) solution & reset lists */
-    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+    // 4) add random v
+    let &v = candidates
+        .choose(rng)
+        .expect("At least one outsider must exist");
+    sol.add(v);
+
+    // 5) update frequency memory
+    freq[u] = freq[u].saturating_add(1);
+    freq[v] = freq[v].saturating_add(1);
+    if freq[u] > k || freq[v] > k {
+        freq.fill(0);
+    }
+
+    // 6) reset tabu and update tenures
     tabu.reset();
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
 }
 
-/*───────────────────────────────────────────────────────────────────*/
-/*  Mild perturbation                                                */
-/*───────────────────────────────────────────────────────────────────*/
-
-/// Mild perturbation: swap worst vertex in S for best outsider (smallest drop in density).
-///
-/// Removes one critical vertex (lowest internal degree) and adds one outsider with the most
-/// edges into S.  Often only slightly degrades density and provides gentle diversification.
+/// Mild perturbation (“small shake”):
+/// 1. Build critical sets A (u ∈ S with minimal deg_in) and B (v ∉ S with maximal deg_in).
+/// 2. Pick random `u ∈ A`, `v ∈ B` and swap them.
+/// 3. Increment `freq[u]` and `freq[v]`; if any `> k`, reset all to 0.
+/// 4. Clear tabu lists and then update tenures.
 pub fn mild_perturbation<'g, R>(
     sol: &mut Solution<'g>,
     tabu: &mut DualTabu,
     rng: &mut R,
     p: &Params,
-    freq: &mut [usize],
+    freq: &mut Vec<usize>,
 ) where
     R: Rng + ?Sized,
 {
-    /* Guard */
-    if sol.size() == 0 {
+    let k = sol.size();
+    if k < 1 {
         return;
     }
+    let graph = sol.graph();
+    let n = graph.n();
 
-    /* 1 ─ identify worst vertex in S */
-    let curr_d = sol.density();
-    let crit_thr = (curr_d * ((sol.size() as f64) - 1.0)).floor() as usize;
-
-    let mut worst_v = None;
-    let mut worst_deg = usize::MAX;
-
+    // 1) critical set A: u ∈ S of minimal internal degree
+    let mut min_in = usize::MAX;
     for u in sol.bitset().iter_ones() {
-        let deg_in = sol
-            .graph()
+        let d = graph
             .neigh_row(u)
             .iter_ones()
             .filter(|&j| sol.bitset()[j])
             .count();
-        if deg_in < crit_thr && deg_in < worst_deg {
-            worst_deg = deg_in;
-            worst_v = Some(u);
-        }
+        min_in = min_in.min(d);
     }
-    // if no vertex is strictly critical, take one with minimal internal degree anyway
-    if worst_v.is_none() {
-        for u in sol.bitset().iter_ones() {
-            let deg_in = sol
-                .graph()
+    let A: Vec<usize> = sol
+        .bitset()
+        .iter_ones()
+        .filter(|&u| {
+            graph
                 .neigh_row(u)
                 .iter_ones()
                 .filter(|&j| sol.bitset()[j])
-                .count();
-            if deg_in < worst_deg {
-                worst_deg = deg_in;
-                worst_v = Some(u);
-            }
-        }
-    }
-    let u = worst_v.expect("S non-empty, so a vertex must exist");
-    sol.remove(u);
+                .count()
+                == min_in
+        })
+        .collect();
 
-    /* 2 ─ outsider with max connections into new S */
-    let mut max_edges = 0usize;
-    for w in 0..sol.graph().n() {
-        if sol.bitset()[w] {
+    // 2) critical set B: v ∉ S of maximal internal degree into S
+    let mut max_out = 0;
+    for v in 0..n {
+        if sol.bitset()[v] {
             continue;
         }
-        let edges_in = sol
-            .graph()
-            .neigh_row(w)
+        let d = graph
+            .neigh_row(v)
             .iter_ones()
             .filter(|&j| sol.bitset()[j])
             .count();
-        max_edges = max_edges.max(edges_in);
+        max_out = max_out.max(d);
     }
-    let mut best_outsiders = Vec::new();
-    for w in 0..sol.graph().n() {
-        if sol.bitset()[w] {
-            continue;
-        }
-        let edges_in = sol
-            .graph()
-            .neigh_row(w)
-            .iter_ones()
-            .filter(|&j| sol.bitset()[j])
-            .count();
-        if edges_in == max_edges {
-            best_outsiders.push(w);
-        }
-    }
-    best_outsiders.shuffle(rng);
-    let v = best_outsiders[0];
+    let B: Vec<usize> = (0..n)
+        .filter(|&v| {
+            !sol.bitset()[v]
+                && graph
+                    .neigh_row(v)
+                    .iter_ones()
+                    .filter(|&j| sol.bitset()[j])
+                    .count()
+                    == max_out
+        })
+        .collect();
+
+    // swap random u∈A, v∈B
+    let &u = A.choose(rng).expect("A must be non-empty");
+    let &v = B.choose(rng).expect("B must be non-empty");
+    sol.remove(u);
     sol.add(v);
 
-    /* 3 ─ update frequencies */
-    for &vx in &[u, v] {
-        freq[vx] += 1;
-        if freq[vx] > sol.size() {
-            freq.fill(0);
-        }
+    // 3) update frequency memory
+    freq[u] = freq[u].saturating_add(1);
+    freq[v] = freq[v].saturating_add(1);
+    if freq[u] > k || freq[v] > k {
+        freq.fill(0);
     }
 
-    /* 4 ─ update tabu & reset */
-    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
+    // 4) reset tabu and update tenures
     tabu.reset();
+    tabu.update_tenures(sol.size(), sol.edges(), p.gamma_target, rng);
 }

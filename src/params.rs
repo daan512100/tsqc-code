@@ -1,44 +1,62 @@
+// src/params.rs
 //! Parameter bundle for TSQC (Tabu Search for γ-quasi-cliques).
 //!
-//! These tunable parameters control the tabu search behavior, diversification intensity, and restart criteria.
-//! 
-//! - `tenure_u` and `tenure_v` are the initial tabu tenures for removed and added vertices (adaptive updates will override them during search).
-//! - `gamma` controls the strength of heavy perturbation in the original design (fraction of the solution to replace). In our adapted implementation, heavy moves always remove 1 vertex (this parameter is unused by the current heavy perturbation logic).
-//! - `gamma_target` is the density threshold (γ) that defines a quasi-clique (feasibility target).
-//! - `stagnation_iter` is the number of consecutive non-improving iterations to tolerate before considering the search "stagnant". (In our implementation, we diversify immediately upon stagnation, so this effectively serves as an upper bound and as a safe value for frequency reset threshold).
-//! - `max_iter` is the global cap on the total number of iterations (across all restarts and moves).
+//! We fix:
+//! - `stagnation_iter` (L) = 1000  (max non-improving iterations before restart)  
+//! - `max_iter`        (Itₘₐₓ) = 100_000_000  (hard cap on total iterations)
+//!
+//! The short‐term tabu tenures `tenure_u`/`tenure_v` are initialized to 1
+//! but are always immediately **overwritten** by our adaptive formula
+//! in `DualTabu::update_tenures(...)`.  
+//!
+//! `gamma_target` must be set by the caller to the desired density threshold.
 
+/// All tunable controls for TSQC.
 #[derive(Clone, Debug)]
 pub struct Params {
-    /* ─── Tabu tenure base (will be adapted dynamically) ─── */
-    pub tenure_u: usize,
-    pub tenure_v: usize,
+    /// Base tenure for forbidding recently removed vertices (Tu).
+    /// *Note:* this value is only a safety minimum—actual Tu is
+    /// recomputed each iteration via §3.4.3.
+    pub tenure_u:         usize,
 
-    /* ─── Diversification ─── */
-    pub gamma:        f64,   // (Unused in new heavy_perturbation) fraction of |S| to remove in original heavy perturbation
-    pub heavy_prob:   f64,   // probability of choosing heavy vs. mild diversification
+    /// Base tenure for forbidding recently added vertices (Tv).
+    /// *Note:* likewise, actual Tv is adaptive.
+    pub tenure_v:         usize,
 
-    /* ─── Quasi-clique feasibility goal ─── */
-    pub gamma_target: f64,   // target density γ for a quasi-clique
+    /// Target density γ ∈ (0,1] defining a γ-quasi-clique.
+    pub gamma_target:     f64,
 
-    /* ─── Restart / search limits ─── */
-    pub stagnation_iter: usize, // stagnation threshold (L in the paper – max consecutive iterations with no improvement)
-    pub max_iter:        usize, // hard cap on total iterations (It_max)
+    /// L: max consecutive non-improving swaps before a diversification
+    /// restart (Section 3.1). Default = 1000.
+    pub stagnation_iter:  usize,
+
+    /// Itₘₐₓ: hard cap on total TSQ iterations across all restarts
+    /// (Section 3.1). Default = 10⁸.
+    pub max_iter:         usize,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self {
-            tenure_u: 7,
-            tenure_v: 7,
-            // A small heavy perturbation probability by default, as TSQC applies heavy moves rarely
-            gamma:      0.50,
-            heavy_prob: 0.10,
-            /* The default gamma_target of 0.90 matches the “sparse quasi-clique” benchmark in the thesis. 
-               It can be adjusted by the caller if a different density threshold is needed. */
-            gamma_target: 0.90,
-            stagnation_iter: 1000,
-            max_iter:        100_000,
+        Params {
+            tenure_u:        1,           // minimal safety base
+            tenure_v:        1,           // minimal safety base
+            gamma_target:    0.90,        // example default; override as needed
+            stagnation_iter: 1_000,       // L = 1000
+            max_iter:        100_000_000, // Itₘₐₓ = 1e8
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn default_params() {
+        let p = Params::default();
+        assert_eq!(p.tenure_u, 1);
+        assert_eq!(p.tenure_v, 1);
+        assert!((p.gamma_target - 0.90).abs() < 1e-12);
+        assert_eq!(p.stagnation_iter, 1_000);
+        assert_eq!(p.max_iter, 100_000_000);
     }
 }
